@@ -6,15 +6,20 @@
   "scripts": {
     "dev": "node server.js",
     "start": "node server.js",
+    "migrate": "node db/migrate.js",
+    "migrate:data": "node scripts/migrate-json-to-postgres.js",
     "test": "node --test server.test.js prompt.test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
+    "@aws-sdk/client-s3": "^3.658.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
     "multer": "^2.4.0",
     "pdf-parse": "^1.1.1",
+    "pg": "^8.13.0",
+    "pgvector": "^0.2.0",
     "tesseract.js": "^7.0.0"
   }
 }

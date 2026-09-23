@@ -5,11 +5,16 @@ import multer from 'multer';
 import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 import { createWorker } from 'tesseract.js';
 import Anthropic from '@anthropic-ai/sdk';
-import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { buildGroundingPrompt, isNotFoundResponse } from './prompt.js';
+import * as objectStore from './storage/objectStore.js';
+import * as documentsDb from './db/documents.js';
+import * as extractionsDb from './db/extractions.js';
+import * as chunksDb from './db/chunks.js';
+import * as queriesDb from './db/queries.js';
+import * as reportsDb from './db/reports.js';
+import { getPool, closePool } from './db/pool.js';
 
 dotenv.config();
 
@@ -22,16 +27,6 @@ const anthropicClient = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_AP
 const OLLAMA_HOST = process.env.OLLAMA_HOST !== undefined ? process.env.OLLAMA_HOST.trim() : 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL?.trim() || 'llama3.1';
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map((origin) => origin.trim());
-const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
-const storageDirectory = process.env.STORAGE_DIR
-  ? path.resolve(process.env.STORAGE_DIR)
-  : path.join(currentDirectory, 'storage');
-const uploadsDirectory = path.join(storageDirectory, 'uploads');
-const metadataPath = path.join(storageDirectory, 'documents.json');
-const extractionsPath = path.join(storageDirectory, 'extractions.json');
-const chunksPath = path.join(storageDirectory, 'chunks.json');
-const queriesPath = path.join(storageDirectory, 'queries.json');
-const reportsPath = path.join(storageDirectory, 'reports.json');
 const fileLimitsMb = {
   'application/pdf': 25,
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 25,
@@ -41,64 +36,6 @@ const fileLimitsMb = {
   'text/plain': 10,
   'text/csv': 10
 };
-
-fs.mkdirSync(uploadsDirectory, { recursive: true });
-if (!fs.existsSync(metadataPath)) fs.writeFileSync(metadataPath, '[]');
-if (!fs.existsSync(extractionsPath)) fs.writeFileSync(extractionsPath, '[]');
-if (!fs.existsSync(chunksPath)) fs.writeFileSync(chunksPath, '[]');
-if (!fs.existsSync(queriesPath)) fs.writeFileSync(queriesPath, '[]');
-if (!fs.existsSync(reportsPath)) fs.writeFileSync(reportsPath, '[]');
-
-function readDocuments() {
-  return JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-}
-
-function writeDocuments(documents) {
-  fs.writeFileSync(metadataPath, JSON.stringify(documents, null, 2));
-}
-
-// Re-reads the documents file and applies `mutate` synchronously (no `await` in between),
-// so a write made by a concurrent request in between cannot be clobbered by a stale in-memory copy.
-function updateDocument(id, mutate) {
-  const documents = readDocuments();
-  const document = documents.find((item) => item.id === id);
-  if (!document) return null;
-  mutate(document);
-  writeDocuments(documents);
-  return document;
-}
-
-function readExtractions() {
-  return JSON.parse(fs.readFileSync(extractionsPath, 'utf8'));
-}
-
-function writeExtractions(extractions) {
-  fs.writeFileSync(extractionsPath, JSON.stringify(extractions, null, 2));
-}
-
-function readChunks() {
-  return JSON.parse(fs.readFileSync(chunksPath, 'utf8'));
-}
-
-function writeChunks(chunks) {
-  fs.writeFileSync(chunksPath, JSON.stringify(chunks, null, 2));
-}
-
-function readQueries() {
-  return JSON.parse(fs.readFileSync(queriesPath, 'utf8'));
-}
-
-function writeQueries(queries) {
-  fs.writeFileSync(queriesPath, JSON.stringify(queries, null, 2));
-}
-
-function readReports() {
-  return JSON.parse(fs.readFileSync(reportsPath, 'utf8'));
-}
-
-function writeReports(reports) {
-  fs.writeFileSync(reportsPath, JSON.stringify(reports, null, 2));
-}
 
 function logEvent(event, fields = {}) {
   console.log(JSON.stringify({ timestamp: new Date().toISOString(), event, ...fields }));
@@ -193,10 +130,9 @@ function createChunks(documentId, pages) {
   return chunks;
 }
 
-function persistChunks(documentId, pages) {
-  const chunks = readChunks().filter((chunk) => chunk.documentId !== documentId);
+async function persistChunks(documentId, pages) {
   const documentChunks = createChunks(documentId, pages);
-  writeChunks([...documentChunks, ...chunks]);
+  await chunksDb.replaceChunksForDocument(documentId, documentChunks);
   return documentChunks;
 }
 
@@ -218,34 +154,27 @@ function cosineSimilarity(left, right) {
   return left.reduce((total, value, index) => total + value * right[index], 0);
 }
 
-function indexDocumentChunks(documentId) {
-  const chunks = readChunks();
-  const documentChunks = chunks.filter((chunk) => chunk.documentId === documentId);
+async function indexDocumentChunks(documentId) {
+  const documentChunks = await chunksDb.getChunksByDocumentId(documentId);
   if (!documentChunks.length) return [];
+  const indexedAt = new Date().toISOString();
   const indexedChunks = documentChunks.map((chunk) => ({
     ...chunk,
     embedding: createDemoEmbedding(chunk.text),
     embeddingModel: 'local-demo-hash-v1',
     embeddingDimensions: 64,
     embeddingStatus: 'indexed',
-    indexedAt: new Date().toISOString()
+    indexedAt
   }));
-  const indexedIds = new Map(indexedChunks.map((chunk) => [chunk.id, chunk]));
-  writeChunks(chunks.map((chunk) => indexedIds.get(chunk.id) || chunk));
+  await chunksDb.setChunkEmbeddings(indexedChunks);
   return indexedChunks;
 }
 
-function removeDocumentData(documentId) {
-  const documents = readDocuments();
-  const document = documents.find((item) => item.id === documentId);
+async function removeDocumentData(documentId) {
+  const document = await documentsDb.deleteDocument(documentId);
   if (!document) return null;
-  const remainingDocuments = documents.filter((item) => item.id !== documentId);
-  writeDocuments(remainingDocuments);
-  writeExtractions(readExtractions().filter((item) => item.documentId !== documentId));
-  writeChunks(readChunks().filter((item) => item.documentId !== documentId));
   if (document.storageName) {
-    const filePath = path.join(uploadsDirectory, document.storageName);
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    await objectStore.deleteObject(document.storageName);
   }
   return document;
 }
@@ -253,21 +182,18 @@ function removeDocumentData(documentId) {
 // For a small, focused set of documents (the common case: a resume, a report), include every
 // indexed chunk in scope so multi-part or "list everything" questions aren't cut off by an
 // arbitrary top-K. For a large corpus, fall back to a bounded top-K to control cost and latency.
-function resolveRetrievalLimit(documentIds) {
+async function resolveRetrievalLimit(documentIds) {
   const minLimit = 5;
   const maxLimit = 15;
-  const candidateCount = readChunks()
-    .filter((chunk) => chunk.embeddingStatus === 'indexed' && (!documentIds || documentIds.includes(chunk.documentId)))
-    .length;
-  return Math.min(Math.max(candidateCount, minLimit), maxLimit);
+  const candidates = await chunksDb.getIndexedChunks(documentIds);
+  return Math.min(Math.max(candidates.length, minLimit), maxLimit);
 }
 
-function searchChunks(query, documentIds = null, limit = 5) {
+async function searchChunks(query, documentIds = null, limit = 5) {
   const queryEmbedding = createDemoEmbedding(query);
   const queryTerms = meaningfulTerms(expandedSearchTerms(query));
-  return readChunks()
-    .filter((chunk) => chunk.embeddingStatus === 'indexed' && Array.isArray(chunk.embedding))
-    .filter((chunk) => !documentIds || documentIds.includes(chunk.documentId))
+  const candidates = await chunksDb.getIndexedChunks(documentIds);
+  return candidates
     .map((chunk) => {
       const chunkTerms = new Set(searchTerms(chunk.text));
       const overlap = [...queryTerms].filter((term) => chunkTerms.has(term)).length;
@@ -375,8 +301,8 @@ async function generateGroundedAnswer(query, results) {
   throw lastError;
 }
 
-async function extractDocument(filePath, mimeType) {
-  const buffer = await fs.promises.readFile(filePath);
+async function extractDocument(storageKey, mimeType) {
+  const buffer = await objectStore.getObjectBuffer(storageKey);
   if (mimeType === 'application/pdf') {
     const parsedPdf = await pdfParse(buffer, {
       pagerender: async (pageData) => {
@@ -396,10 +322,11 @@ async function extractDocument(filePath, mimeType) {
   return { text, pages: [{ pageNumber: 1, text, confidence: null }] };
 }
 
-async function ocrDocument(filePath) {
+async function ocrDocument(storageKey) {
   const worker = await createWorker('eng');
   try {
-    const result = await worker.recognize(filePath);
+    const buffer = await objectStore.getObjectBuffer(storageKey);
+    const result = await worker.recognize(buffer);
     const text = result.data.text.trim();
     return {
       text,
@@ -415,11 +342,11 @@ async function ocrDocument(filePath) {
 }
 
 const upload = multer({
-  dest: uploadsDirectory,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (req, file, callback) => {
     if (!fileLimitsMb[file.mimetype]) {
-      callback(new Error(`Unsupported file type: ${file.mimetype || 'unknown'}`));
+      callback(Object.assign(new Error(`Unsupported file type: ${file.mimetype || 'unknown'}`), { status: 400 }));
       return;
     }
     callback(null, true);
@@ -446,6 +373,31 @@ app.use((req, res, next) => {
   next();
 });
 
+// Express 4 (unlike 5) does not forward a rejected promise from an async route handler to the
+// error-handling middleware - it becomes an unhandled rejection that crashes the whole process,
+// taking down every concurrent user's request, not just the one that failed. This happened twice
+// live: a Postgres encoding error and a MinIO outage each killed the server. Every async route is
+// wrapped in this so a failure anywhere - now or in code added later - degrades to a clean error
+// response instead of an outage.
+function asyncRoute(handler) {
+  return (req, res, next) => {
+    try {
+      Promise.resolve(handler(req, res, next)).catch(next);
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+// Wrap every route registration once, here, rather than each call site below - this is the
+// single place that guarantees no route (including ones added later) can crash the process by
+// forgetting to catch its own errors. Harmless for non-async middleware like multer's upload
+// handler, which manages its own error path via next() and never returns a rejected promise.
+for (const method of ['get', 'post', 'delete']) {
+  const original = app[method].bind(app);
+  app[method] = (routePath, ...handlers) => original(routePath, ...handlers.map(asyncRoute));
+}
+
 function requireApiKey(req, res, next) {
   if (req.path === '/health' || !API_KEY) return next();
   if (req.get('x-api-key') !== API_KEY) {
@@ -457,8 +409,12 @@ function requireApiKey(req, res, next) {
 
 app.use('/api', requireApiKey);
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'amplify-ai-server', checks: { metadataStorage: fs.existsSync(metadataPath), uploadStorage: fs.existsSync(uploadsDirectory) } });
+app.get('/api/health', async (req, res) => {
+  const [databaseHealthy, objectStoreHealthy] = await Promise.all([
+    getPool().query('SELECT 1').then(() => true).catch(() => false),
+    objectStore.isHealthy()
+  ]);
+  res.json({ status: 'ok', service: 'amplify-ai-server', checks: { database: databaseHealthy, objectStorage: objectStoreHealthy } });
 });
 
 app.get('/api/summary', (req, res) => {
@@ -470,12 +426,12 @@ app.get('/api/summary', (req, res) => {
   });
 });
 
-app.get('/api/documents', (req, res) => {
-  res.json({ documents: readDocuments() });
+app.get('/api/documents', async (req, res) => {
+  res.json({ documents: await documentsDb.getAllDocuments() });
 });
 
-app.get('/api/documents/:id', (req, res) => {
-  const document = readDocuments().find((item) => item.id === req.params.id);
+app.get('/api/documents/:id', async (req, res) => {
+  const document = await documentsDb.getDocumentById(req.params.id);
   if (!document) {
     res.status(404).json({ error: 'Document not found' });
     return;
@@ -483,8 +439,8 @@ app.get('/api/documents/:id', (req, res) => {
   res.json({ document });
 });
 
-app.get('/api/documents/:id/extraction', (req, res) => {
-  const extraction = readExtractions().find((item) => item.documentId === req.params.id);
+app.get('/api/documents/:id/extraction', async (req, res) => {
+  const extraction = await extractionsDb.getExtractionByDocumentId(req.params.id);
   if (!extraction) {
     res.status(404).json({ error: 'Extraction not found' });
     return;
@@ -492,16 +448,16 @@ app.get('/api/documents/:id/extraction', (req, res) => {
   res.json({ extraction });
 });
 
-app.get('/api/documents/:id/chunks', (req, res) => {
-  const document = readDocuments().find((item) => item.id === req.params.id);
+app.get('/api/documents/:id/chunks', async (req, res) => {
+  const document = await documentsDb.getDocumentById(req.params.id);
   if (!document) {
     res.status(404).json({ error: 'Document not found' });
     return;
   }
-  res.json({ chunks: readChunks().filter((chunk) => chunk.documentId === req.params.id) });
+  res.json({ chunks: await chunksDb.getChunksByDocumentId(req.params.id) });
 });
 
-app.post('/api/search', (req, res) => {
+app.post('/api/search', async (req, res) => {
   const query = typeof req.body?.query === 'string' ? normalizeText(req.body.query) : '';
   const requestedLimit = Number(req.body?.limit) || 5;
   const limit = Math.min(Math.max(requestedLimit, 1), 20);
@@ -511,20 +467,20 @@ app.post('/api/search', (req, res) => {
     return;
   }
 
-  const results = searchChunks(query, documentIds, limit);
+  const results = await searchChunks(query, documentIds, limit);
   res.json({ query, results, index: 'local-demo-hash-v1' });
 });
 
-app.post('/api/search/evaluate', (req, res) => {
+app.post('/api/search/evaluate', async (req, res) => {
   const cases = Array.isArray(req.body?.cases) ? req.body.cases : [];
   if (!cases.length) {
     res.status(400).json({ error: 'At least one evaluation case is required' });
     return;
   }
-  const evaluations = cases.map((evaluationCase) => {
+  const evaluations = await Promise.all(cases.map(async (evaluationCase) => {
     const query = typeof evaluationCase.query === 'string' ? normalizeText(evaluationCase.query) : '';
     const expectedDocumentIds = Array.isArray(evaluationCase.expectedDocumentIds) ? evaluationCase.expectedDocumentIds : [];
-    const results = query ? searchChunks(query, null, 5) : [];
+    const results = query ? await searchChunks(query, null, 5) : [];
     const relevantResults = results.filter((result) => expectedDocumentIds.includes(result.documentId));
     return {
       query,
@@ -533,7 +489,7 @@ app.post('/api/search/evaluate', (req, res) => {
       hit: relevantResults.length > 0,
       reciprocalRank: relevantResults.length ? 1 / (results.findIndex((result) => expectedDocumentIds.includes(result.documentId)) + 1) : 0
     };
-  });
+  }));
   const hits = evaluations.filter((evaluation) => evaluation.hit).length;
   const meanReciprocalRank = evaluations.reduce((total, evaluation) => total + evaluation.reciprocalRank, 0) / evaluations.length;
   res.json({
@@ -564,7 +520,8 @@ app.post('/api/questions', async (req, res) => {
     citations: [],
     createdAt: new Date().toISOString()
   };
-  const results = searchChunks(question, documentIds, resolveRetrievalLimit(documentIds));
+  const retrievalLimit = await resolveRetrievalLimit(documentIds);
+  const results = await searchChunks(question, documentIds, retrievalLimit);
   let answer = null;
   let generationFailed = true;
   try {
@@ -585,7 +542,7 @@ app.post('/api/questions', async (req, res) => {
     query.status = 'completed';
     query.answer = answer.text;
     query.evidence = answer.evidence;
-    const documentsById = new Map(readDocuments().map((document) => [document.id, document]));
+    const documentsById = new Map((await documentsDb.getAllDocuments()).map((document) => [document.id, document]));
     query.citations = answer.evidence.map((evidence) => ({
       documentId: evidence.documentId,
       documentName: documentsById.get(evidence.documentId)?.name || 'Unknown document',
@@ -595,14 +552,12 @@ app.post('/api/questions', async (req, res) => {
       relevanceScore: evidence.relevanceScore
     }));
   }
-  const queries = readQueries();
-  queries.unshift(query);
-  writeQueries(queries);
-  res.status(201).json(query);
+  const savedQuery = await queriesDb.insertQuery(query);
+  res.status(201).json(savedQuery);
 });
 
-app.get('/api/questions/:id', (req, res) => {
-  const query = readQueries().find((item) => item.id === req.params.id);
+app.get('/api/questions/:id', async (req, res) => {
+  const query = await queriesDb.getQueryById(req.params.id);
   if (!query) {
     res.status(404).json({ error: 'Question not found' });
     return;
@@ -610,12 +565,12 @@ app.get('/api/questions/:id', (req, res) => {
   res.json(query);
 });
 
-app.post('/api/reports', (req, res) => {
+app.post('/api/reports', async (req, res) => {
   const title = typeof req.body?.title === 'string' && req.body.title.trim() ? req.body.title.trim() : 'Document intelligence report';
   const queryIds = Array.isArray(req.body?.queryIds) ? req.body.queryIds : [];
   const documentIds = Array.isArray(req.body?.documentIds) ? req.body.documentIds : [];
-  const queries = readQueries().filter((query) => queryIds.includes(query.id));
-  const documents = readDocuments().filter((document) => documentIds.includes(document.id));
+  const queries = queryIds.length ? await queriesDb.getQueriesByIds(queryIds) : [];
+  const documents = (await documentsDb.getAllDocuments()).filter((document) => documentIds.includes(document.id));
   if (!queries.length && !documents.length) {
     res.status(400).json({ error: 'At least one question or document is required' });
     return;
@@ -644,18 +599,16 @@ app.post('/api/reports', (req, res) => {
     downloadUrl: `/api/reports/${reportId}/download`,
     createdAt: new Date().toISOString()
   };
-  const reports = readReports();
-  reports.unshift(report);
-  writeReports(reports);
+  await reportsDb.insertReport(report);
   res.status(201).json({ ...report, content: undefined });
 });
 
-app.get('/api/reports', (req, res) => {
-  res.json({ reports: readReports().map(({ content, ...report }) => report) });
+app.get('/api/reports', async (req, res) => {
+  res.json({ reports: (await reportsDb.getAllReports()).map(({ content, ...report }) => report) });
 });
 
-app.get('/api/reports/:id/download', (req, res) => {
-  const report = readReports().find((item) => item.id === req.params.id);
+app.get('/api/reports/:id/download', async (req, res) => {
+  const report = await reportsDb.getReportById(req.params.id);
   if (!report) {
     res.status(404).json({ error: 'Report not found' });
     return;
@@ -663,23 +616,25 @@ app.get('/api/reports/:id/download', (req, res) => {
   res.type('text/markdown').attachment(`${report.id}.md`).send(report.content);
 });
 
-app.post('/api/index/rebuild', (req, res) => {
-  const documents = readDocuments();
+app.post('/api/index/rebuild', async (req, res) => {
+  const documents = await documentsDb.getAllDocuments();
   const indexed = [];
   for (const document of documents) {
-    if (readChunks().some((chunk) => chunk.documentId === document.id)) {
-      indexed.push(...indexDocumentChunks(document.id));
-      document.status = 'ready';
-      document.embeddingStatus = 'indexed';
-      document.updatedAt = new Date().toISOString();
+    const existingChunks = await chunksDb.getChunksByDocumentId(document.id);
+    if (existingChunks.length) {
+      indexed.push(...(await indexDocumentChunks(document.id)));
+      await documentsDb.updateDocument(document.id, {
+        status: 'ready',
+        embeddingStatus: 'indexed',
+        updatedAt: new Date().toISOString()
+      });
     }
   }
-  writeDocuments(documents);
   res.json({ indexedChunks: indexed.length, documentCount: documents.length, model: 'local-demo-hash-v1' });
 });
 
-app.delete('/api/documents/:id', (req, res) => {
-  const document = removeDocumentData(req.params.id);
+app.delete('/api/documents/:id', async (req, res) => {
+  const document = await removeDocumentData(req.params.id);
   if (!document) {
     res.status(404).json({ error: 'Document not found' });
     return;
@@ -687,38 +642,48 @@ app.delete('/api/documents/:id', (req, res) => {
   res.status(204).send();
 });
 
-app.post('/api/documents/:id/index', (req, res) => {
-  const documents = readDocuments();
-  const documentIndex = documents.findIndex((item) => item.id === req.params.id);
-  if (documentIndex === -1) {
+app.post('/api/documents/:id/index', async (req, res) => {
+  let document = await documentsDb.getDocumentById(req.params.id);
+  if (!document) {
     res.status(404).json({ error: 'Document not found' });
     return;
   }
 
-  const document = documents[documentIndex];
   try {
-    const chunks = indexDocumentChunks(document.id);
+    const chunks = await indexDocumentChunks(document.id);
     if (!chunks.length) {
       res.status(422).json({ error: 'Extract document text before creating embeddings' });
       return;
     }
-    document.status = 'ready';
-    document.embeddingStatus = 'indexed';
-    document.chunkCount = chunks.length;
-    document.updatedAt = new Date().toISOString();
-    document.error = null;
-    writeDocuments(documents);
+    document = await documentsDb.updateDocument(document.id, {
+      status: 'ready',
+      embeddingStatus: 'indexed',
+      chunkCount: chunks.length,
+      updatedAt: new Date().toISOString(),
+      error: null
+    });
     res.json({ document, chunks, model: 'local-demo-hash-v1' });
   } catch (error) {
-    document.embeddingStatus = 'failed';
-    document.error = error.message;
-    document.updatedAt = new Date().toISOString();
-    writeDocuments(documents);
+    document = await documentsDb.updateDocument(document.id, {
+      embeddingStatus: 'failed',
+      error: error.message,
+      updatedAt: new Date().toISOString()
+    });
     res.status(422).json({ error: `Embedding generation failed: ${error.message}`, document });
   }
 });
 
-app.post('/api/documents', upload.single('file'), (req, res) => {
+const extensionByMimeType = {
+  'application/pdf': '.pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'text/plain': '.txt',
+  'text/csv': '.csv'
+};
+
+app.post('/api/documents', upload.single('file'), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: 'A document file is required' });
     return;
@@ -726,14 +691,17 @@ app.post('/api/documents', upload.single('file'), (req, res) => {
 
   const maxSizeBytes = fileLimitsMb[req.file.mimetype] * 1024 * 1024;
   if (req.file.size > maxSizeBytes) {
-    fs.unlinkSync(req.file.path);
     res.status(413).json({ error: `File exceeds the ${fileLimitsMb[req.file.mimetype]} MB limit` });
     return;
   }
 
   const now = new Date().toISOString();
-  const document = {
-    id: `doc_${randomUUID()}`,
+  const id = `doc_${randomUUID()}`;
+  const storageName = `documents/${id}/original${extensionByMimeType[req.file.mimetype] || ''}`;
+  await objectStore.putObject(storageName, req.file.buffer, req.file.mimetype);
+
+  const document = await documentsDb.insertDocument({
+    id,
     name: path.basename(req.file.originalname).replace(/[\r\n]/g, '').slice(0, 255),
     mimeType: req.file.mimetype,
     sizeBytes: req.file.size,
@@ -742,20 +710,16 @@ app.post('/api/documents', upload.single('file'), (req, res) => {
     updatedAt: now,
     pageCount: null,
     error: null,
-    storageName: req.file.filename
-  };
-
-  const documents = readDocuments();
-  documents.unshift(document);
-  writeDocuments(documents);
+    storageName
+  });
   res.status(201).json({ document });
 });
 
 app.post('/api/documents/:id/extract', async (req, res) => {
-  let document = updateDocument(req.params.id, (doc) => {
-    doc.status = 'extracting';
-    doc.updatedAt = new Date().toISOString();
-    doc.error = null;
+  let document = await documentsDb.updateDocument(req.params.id, {
+    status: 'extracting',
+    updatedAt: new Date().toISOString(),
+    error: null
   });
   if (!document) {
     res.status(404).json({ error: 'Document not found' });
@@ -763,39 +727,36 @@ app.post('/api/documents/:id/extract', async (req, res) => {
   }
 
   try {
-    const result = await withRetry(() => extractDocument(path.join(uploadsDirectory, document.storageName), document.mimeType));
-    const extraction = {
+    const result = await withRetry(() => extractDocument(document.storageName, document.mimeType));
+    const extraction = await extractionsDb.upsertExtraction({
       documentId: document.id,
       status: 'completed',
       text: result.text,
       pages: result.pages,
       error: null,
       extractedAt: new Date().toISOString()
-    };
-    const extractions = readExtractions().filter((item) => item.documentId !== document.id);
-    extractions.unshift(extraction);
-    writeExtractions(extractions);
-    const chunks = persistChunks(document.id, result.pages);
+    });
+    const chunks = await persistChunks(document.id, result.pages);
 
-    document = updateDocument(document.id, (doc) => {
-      doc.status = 'extracted';
-      doc.pageCount = result.pages.length;
-      doc.chunkCount = chunks.length;
-      doc.updatedAt = new Date().toISOString();
+    document = await documentsDb.updateDocument(document.id, {
+      status: 'extracted',
+      pageCount: result.pages.length,
+      chunkCount: chunks.length,
+      updatedAt: new Date().toISOString()
     });
     res.json({ document, extraction, chunks });
   } catch (error) {
-    document = updateDocument(document.id, (doc) => {
-      doc.status = 'failed';
-      doc.error = error.message;
-      doc.updatedAt = new Date().toISOString();
+    document = await documentsDb.updateDocument(document.id, {
+      status: 'failed',
+      error: error.message,
+      updatedAt: new Date().toISOString()
     });
     res.status(422).json({ error: `Text extraction failed: ${error.message}`, document });
   }
 });
 
 app.post('/api/documents/:id/ocr', async (req, res) => {
-  const existing = readDocuments().find((item) => item.id === req.params.id);
+  const existing = await documentsDb.getDocumentById(req.params.id);
   if (!existing) {
     res.status(404).json({ error: 'Document not found' });
     return;
@@ -805,15 +766,15 @@ app.post('/api/documents/:id/ocr', async (req, res) => {
     return;
   }
 
-  let document = updateDocument(req.params.id, (doc) => {
-    doc.status = 'extracting';
-    doc.updatedAt = new Date().toISOString();
-    doc.error = null;
+  let document = await documentsDb.updateDocument(req.params.id, {
+    status: 'extracting',
+    updatedAt: new Date().toISOString(),
+    error: null
   });
 
   try {
-    const result = await withRetry(() => ocrDocument(path.join(uploadsDirectory, document.storageName)));
-    const extraction = {
+    const result = await withRetry(() => ocrDocument(document.storageName));
+    const extraction = await extractionsDb.upsertExtraction({
       documentId: document.id,
       status: 'completed',
       method: 'ocr',
@@ -821,24 +782,21 @@ app.post('/api/documents/:id/ocr', async (req, res) => {
       pages: result.pages,
       error: null,
       extractedAt: new Date().toISOString()
-    };
-    const extractions = readExtractions().filter((item) => item.documentId !== document.id);
-    extractions.unshift(extraction);
-    writeExtractions(extractions);
-    const chunks = persistChunks(document.id, result.pages);
+    });
+    const chunks = await persistChunks(document.id, result.pages);
 
-    document = updateDocument(document.id, (doc) => {
-      doc.status = 'extracted';
-      doc.pageCount = 1;
-      doc.chunkCount = chunks.length;
-      doc.updatedAt = new Date().toISOString();
+    document = await documentsDb.updateDocument(document.id, {
+      status: 'extracted',
+      pageCount: 1,
+      chunkCount: chunks.length,
+      updatedAt: new Date().toISOString()
     });
     res.json({ document, extraction, chunks });
   } catch (error) {
-    document = updateDocument(document.id, (doc) => {
-      doc.status = 'failed';
-      doc.error = error.message;
-      doc.updatedAt = new Date().toISOString();
+    document = await documentsDb.updateDocument(document.id, {
+      status: 'failed',
+      error: error.message,
+      updatedAt: new Date().toISOString()
     });
     res.status(422).json({ error: `OCR failed: ${error.message}`, document });
   }
@@ -855,11 +813,31 @@ app.use((error, req, res, next) => {
       res.status(413).json({ error: 'Request payload is too large' });
       return;
     }
-    res.status(400).json({ error: 'The request body could not be parsed' });
+    if (error.type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'The request body could not be parsed' });
+      return;
+    }
+    if (Number.isInteger(error.status) && error.status >= 400 && error.status < 500) {
+      // An explicitly marked client error (e.g. multer's fileFilter rejecting an unsupported
+      // type) - its message is intended to be shown, unlike an unexpected server failure.
+      res.status(error.status).json({ error: error.message });
+      return;
+    }
+    // Anything else - a Postgres or MinIO failure forwarded by asyncRoute, most likely - is an
+    // infrastructure problem, not something wrong with the request. Don't call it a parsing issue.
+    res.status(500).json({ error: 'Internal server error' });
     return;
   }
   next();
 });
+
+try {
+  await objectStore.ensureBucket();
+} catch (error) {
+  // Don't let a transient object-storage outage prevent the process from starting at all -
+  // /api/health will correctly report it as unhealthy once the server is up.
+  logEvent('object_store_startup_check_failed', { error: error.message });
+}
 
 const server = app.listen(PORT, () => {
   logEvent('server_started', { port: PORT });
@@ -867,7 +845,8 @@ const server = app.listen(PORT, () => {
 
 function shutdown(signal) {
   logEvent('server_shutdown_started', { signal });
-  server.close(() => {
+  server.close(async () => {
+    await closePool();
     logEvent('server_shutdown_completed');
     process.exit(0);
   });

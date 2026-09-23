@@ -11,6 +11,20 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: amplify
+          POSTGRES_PASSWORD: amplify
+          POSTGRES_DB: amplify_ai
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U amplify"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -24,8 +38,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # MinIO's image has no default command (it just prints help and exits), and GitHub Actions'
+      # `services:` block can't override a container's command - so it's started as a plain step
+      # instead of a service.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=amplify -e MINIO_ROOT_PASSWORD=amplify123 \
+            quay.io/minio/minio:latest server /data
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            sleep 1
+          done
+
       - name: Verify tests and production build
         run: npm run verify
+        env:
+          DATABASE_URL: postgresql://amplify:amplify@localhost:5432/amplify_ai
+          TEST_ADMIN_DATABASE_URL: postgresql://amplify:amplify@localhost:5432/postgres
+          OBJECT_STORE_ENDPOINT: http://localhost:9000
+          OBJECT_STORE_ACCESS_KEY: amplify
+          OBJECT_STORE_SECRET_KEY: amplify123
 
       - name: Validate JavaScript syntax
         run: node --check server/server.js && node --check server/server.test.js

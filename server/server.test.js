@@ -1,18 +1,49 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
-import { test, after } from 'node:test';
+import { randomUUID } from 'node:crypto';
+import { test, before, after } from 'node:test';
+import pg from 'pg';
+import { S3Client, CreateBucketCommand, ListObjectsV2Command, DeleteObjectCommand, DeleteBucketCommand } from '@aws-sdk/client-s3';
+import { runMigrations } from './db/migrate.js';
 
 const port = 4100;
 const baseUrl = `http://localhost:${port}`;
-const testStorageDir = mkdtempSync(path.join(tmpdir(), 'amplify-ai-server-test-'));
-const serverProcess = spawn(process.execPath, ['server.js'], {
-  cwd: process.cwd(),
-  env: { ...process.env, PORT: String(port), STORAGE_DIR: testStorageDir, OLLAMA_HOST: '', ANTHROPIC_API_KEY: '' },
-  stdio: ['ignore', 'pipe', 'pipe']
+
+const adminUrl = process.env.TEST_ADMIN_DATABASE_URL || 'postgresql://amplify:amplify@localhost:5432/postgres';
+const testDbName = `amplify_ai_test_${randomUUID().replace(/-/g, '_')}`;
+const testDatabaseUrl = adminUrl.replace(/\/[^/]*$/, `/${testDbName}`);
+const testBucket = `documents-test-${randomUUID()}`;
+
+let serverProcess;
+
+before(async () => {
+  const admin = new pg.Client({ connectionString: adminUrl });
+  await admin.connect();
+  await admin.query(`CREATE DATABASE ${testDbName}`);
+  await admin.end();
+  await runMigrations(testDatabaseUrl);
+
+  const s3 = new S3Client({
+    region: 'us-east-1',
+    endpoint: 'http://localhost:9000',
+    forcePathStyle: true,
+    credentials: { accessKeyId: 'amplify', secretAccessKey: 'amplify123' }
+  });
+  await s3.send(new CreateBucketCommand({ Bucket: testBucket }));
+
+  serverProcess = spawn(process.execPath, ['server.js'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DATABASE_URL: testDatabaseUrl,
+      OBJECT_STORE_BUCKET: testBucket,
+      OLLAMA_HOST: '',
+      ANTHROPIC_API_KEY: ''
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
 });
 
 async function waitForServer() {
@@ -221,8 +252,92 @@ test('malformed request bodies get safe generic errors, not leaked internals', a
   assert.equal(oversizedBody.error, 'Request payload is too large');
 });
 
+test('a NUL byte in user input does not crash the server', async () => {
+  await waitForServer();
+
+  // Postgres rejects a NUL byte (0x00) in any text parameter as an encoding error; left
+  // unsanitized, that error was an uncaught rejection that took the entire process down for
+  // every concurrent user, not just the one bad request - discovered live, not hypothesized.
+  const question = await request('/api/questions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ question: 'revenue\u0000test' })
+  });
+  assert.equal(question.response.status, 201);
+  assert.ok(!question.body.question.includes('\u0000'), 'the NUL byte must be stripped, not merely tolerated');
+
+  // The server must still be responsive right after - this is the property that actually matters.
+  const health = await request('/api/health');
+  assert.equal(health.response.status, 200);
+});
+
+test('an unreachable database degrades to a clean error instead of crashing the process', async () => {
+  // Express 4 does not forward a rejected promise from an async route handler to error-handling
+  // middleware on its own - an uncaught rejection crashes the whole process. This happened live,
+  // twice (a Postgres error, then a MinIO outage), each taking down every concurrent user's
+  // request, not just the failing one. Reproduced here without needing a real outage: point a
+  // fresh server instance at an address nothing is listening on.
+  const brokenPort = 4102;
+  const brokenProcess = spawn(process.execPath, ['server.js'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      PORT: String(brokenPort),
+      DATABASE_URL: 'postgresql://amplify:amplify@localhost:1/nonexistent',
+      OBJECT_STORE_ENDPOINT: 'http://localhost:1',
+      OLLAMA_HOST: '',
+      ANTHROPIC_API_KEY: ''
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  try {
+    const brokenBaseUrl = `http://localhost:${brokenPort}`;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      try {
+        const response = await fetch(`${brokenBaseUrl}/api/health`);
+        if (response.ok) break;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    const health = await fetch(`${brokenBaseUrl}/api/health`);
+    assert.equal(health.status, 200, 'the process must start and answer health checks even with unreachable infra');
+    const healthBody = await health.json();
+    assert.equal(healthBody.checks.database, false);
+    assert.equal(healthBody.checks.objectStorage, false);
+
+    const listDocuments = await fetch(`${brokenBaseUrl}/api/documents`);
+    assert.equal(listDocuments.status, 500, 'a real DB-dependent route must degrade to a clean 500');
+    const errorBody = await listDocuments.json();
+    assert.equal(errorBody.error, 'Internal server error');
+
+    const stillAlive = await fetch(`${brokenBaseUrl}/api/health`);
+    assert.equal(stillAlive.status, 200, 'the process must still be alive after the failed request');
+  } finally {
+    brokenProcess.kill('SIGTERM');
+    await once(brokenProcess, 'exit');
+  }
+});
+
 after(async () => {
   serverProcess.kill('SIGTERM');
   await once(serverProcess, 'exit');
-  rmSync(testStorageDir, { recursive: true, force: true });
+
+  const s3 = new S3Client({
+    region: 'us-east-1',
+    endpoint: 'http://localhost:9000',
+    forcePathStyle: true,
+    credentials: { accessKeyId: 'amplify', secretAccessKey: 'amplify123' }
+  });
+  const { Contents } = await s3.send(new ListObjectsV2Command({ Bucket: testBucket }));
+  for (const object of Contents || []) {
+    await s3.send(new DeleteObjectCommand({ Bucket: testBucket, Key: object.Key }));
+  }
+  await s3.send(new DeleteBucketCommand({ Bucket: testBucket }));
+
+  const admin = new pg.Client({ connectionString: adminUrl });
+  await admin.connect();
+  await admin.query(`DROP DATABASE ${testDbName} WITH (FORCE)`);
+  await admin.end();
 });

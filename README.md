@@ -22,8 +22,13 @@ Set up the working project skeleton and a professional UI shell so the team can 
 
 ## Local run
 
+Requires [Docker](https://www.docker.com/) for Postgres (with pgvector) and MinIO.
+
 ```bash
 npm install
+npm run docker:up      # starts Postgres + MinIO
+npm run migrate --workspace server
+cp server/.env.example server/.env   # fill in ANTHROPIC_API_KEY if not using local Ollama
 npm run dev
 npm test --workspace server
 ```
