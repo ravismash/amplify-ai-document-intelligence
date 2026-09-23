@@ -8,7 +8,7 @@
     "start": "node server.js",
     "migrate": "node db/migrate.js",
     "migrate:data": "node scripts/migrate-json-to-postgres.js",
-    "test": "node --test server.test.js prompt.test.js"
+    "test": "node --test server.test.js prompt.test.js db/db.smoke.test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",

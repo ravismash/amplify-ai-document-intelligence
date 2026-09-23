@@ -6,7 +6,7 @@ import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 import { createWorker } from 'tesseract.js';
 import Anthropic from '@anthropic-ai/sdk';
 import path from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { buildGroundingPrompt, isNotFoundResponse } from './prompt.js';
 import * as objectStore from './storage/objectStore.js';
 import * as documentsDb from './db/documents.js';
@@ -25,7 +25,8 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY?.trim() || '';
 const ANSWER_MODEL = 'claude-sonnet-5';
 const anthropicClient = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 const OLLAMA_HOST = process.env.OLLAMA_HOST !== undefined ? process.env.OLLAMA_HOST.trim() : 'http://localhost:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL?.trim() || 'llama3.1';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL !== undefined ? process.env.OLLAMA_MODEL.trim() : 'llama3.1';
+const OLLAMA_EMBEDDING_MODEL = process.env.OLLAMA_EMBEDDING_MODEL?.trim() || 'nomic-embed-text';
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map((origin) => origin.trim());
 const fileLimitsMb = {
   'application/pdf': 25,
@@ -136,33 +137,52 @@ async function persistChunks(documentId, pages) {
   return documentChunks;
 }
 
-function createDemoEmbedding(text) {
-  const dimensions = 64;
-  const vector = Array.from({ length: dimensions }, () => 0);
-  const tokens = normalizeText(text).toLowerCase().match(/[a-z0-9]+/g) || [];
-  for (const token of tokens) {
-    const digest = createHash('sha256').update(token).digest();
-    const index = digest[0] % dimensions;
-    const sign = digest[1] % 2 === 0 ? 1 : -1;
-    vector[index] += sign * (1 + (digest[2] / 255));
+async function callOllamaEmbeddingBatch(texts) {
+  const response = await fetch(`${OLLAMA_HOST}/api/embed`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: OLLAMA_EMBEDDING_MODEL, input: texts })
+  });
+  if (!response.ok) throw new Error(`Ollama embedding request failed: ${response.status}`);
+  const data = await response.json();
+  return data.embeddings;
+}
+
+// nomic-embed-text is trained on prefixed inputs and produces poorly separated similarity scores
+// without them - documents and queries use different prefixes because the model is asymmetric
+// (a query and its matching passage aren't expected to look alike, unlike a passage vs itself).
+async function embedTexts(texts, taskPrefix, batchSize = 16) {
+  const vectors = [];
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize).map((text) => `${taskPrefix}${text}`);
+    vectors.push(...(await withRetry(() => callOllamaEmbeddingBatch(batch))));
   }
-  const magnitude = Math.sqrt(vector.reduce((total, value) => total + value ** 2, 0)) || 1;
-  return vector.map((value) => Number((value / magnitude).toFixed(6)));
+  return vectors;
 }
 
 function cosineSimilarity(left, right) {
-  return left.reduce((total, value, index) => total + value * right[index], 0);
+  let dot = 0;
+  let leftMagnitude = 0;
+  let rightMagnitude = 0;
+  for (let i = 0; i < left.length; i += 1) {
+    dot += left[i] * right[i];
+    leftMagnitude += left[i] ** 2;
+    rightMagnitude += right[i] ** 2;
+  }
+  const denominator = Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude);
+  return denominator === 0 ? 0 : dot / denominator;
 }
 
 async function indexDocumentChunks(documentId) {
   const documentChunks = await chunksDb.getChunksByDocumentId(documentId);
   if (!documentChunks.length) return [];
+  const embeddings = await embedTexts(documentChunks.map((chunk) => chunk.text), 'search_document: ');
   const indexedAt = new Date().toISOString();
-  const indexedChunks = documentChunks.map((chunk) => ({
+  const indexedChunks = documentChunks.map((chunk, index) => ({
     ...chunk,
-    embedding: createDemoEmbedding(chunk.text),
-    embeddingModel: 'local-demo-hash-v1',
-    embeddingDimensions: 64,
+    embedding: embeddings[index],
+    embeddingModel: OLLAMA_EMBEDDING_MODEL,
+    embeddingDimensions: embeddings[index].length,
     embeddingStatus: 'indexed',
     indexedAt
   }));
@@ -190,7 +210,7 @@ async function resolveRetrievalLimit(documentIds) {
 }
 
 async function searchChunks(query, documentIds = null, limit = 5) {
-  const queryEmbedding = createDemoEmbedding(query);
+  const [queryEmbedding] = await embedTexts([query], 'search_query: ');
   const queryTerms = meaningfulTerms(expandedSearchTerms(query));
   const candidates = await chunksDb.getIndexedChunks(documentIds);
   return candidates
@@ -217,7 +237,12 @@ function createExtractiveAnswer(query, results) {
     matchedTerms: searchTerms(result.text).filter((term) => queryTerms.has(term))
   })).filter((result) => result.matchedTerms.length > 0);
   const hasLexicalEvidence = relevantResults.length > 0;
-  const hasStrongSemanticEvidence = results[0]?.score >= 0.45;
+  // Empirically retuned for nomic-embed-text (was 0.45, tuned against the old demo-hash
+  // embedding): real embeddings sit on a much narrower, higher baseline range - unrelated
+  // queries against this app's typical documents scored up to ~0.545, genuinely relevant ones
+  // as low as ~0.56, on real test data. hasLexicalEvidence remains the primary safety net;
+  // this threshold only matters when a query has zero literal term overlap with any chunk.
+  const hasStrongSemanticEvidence = results[0]?.score >= 0.55;
   if (!results.length || (!hasLexicalEvidence && !hasStrongSemanticEvidence)) return null;
   const selectedResults = (relevantResults.length ? relevantResults : results).slice(0, 2);
   const snippets = selectedResults.map((result) => {
@@ -271,7 +296,7 @@ async function callAnthropic(system, user) {
 async function generateGroundedAnswer(query, results) {
   if (!results.length) return null;
   const providers = [
-    ...(OLLAMA_HOST ? [{ name: `ollama:${OLLAMA_MODEL}`, call: callOllama }] : []),
+    ...(OLLAMA_HOST && OLLAMA_MODEL ? [{ name: `ollama:${OLLAMA_MODEL}`, call: callOllama }] : []),
     ...(anthropicClient ? [{ name: ANSWER_MODEL, call: callAnthropic }] : [])
   ];
   if (!providers.length) throw new Error('No answer-generation providers configured');
@@ -468,7 +493,7 @@ app.post('/api/search', async (req, res) => {
   }
 
   const results = await searchChunks(query, documentIds, limit);
-  res.json({ query, results, index: 'local-demo-hash-v1' });
+  res.json({ query, results, index: OLLAMA_EMBEDDING_MODEL });
 });
 
 app.post('/api/search/evaluate', async (req, res) => {
@@ -619,18 +644,33 @@ app.get('/api/reports/:id/download', async (req, res) => {
 app.post('/api/index/rebuild', async (req, res) => {
   const documents = await documentsDb.getAllDocuments();
   const indexed = [];
+  const failures = [];
   for (const document of documents) {
-    const existingChunks = await chunksDb.getChunksByDocumentId(document.id);
-    if (existingChunks.length) {
+    try {
+      const existingChunks = await chunksDb.getChunksByDocumentId(document.id);
+      if (!existingChunks.length) continue;
       indexed.push(...(await indexDocumentChunks(document.id)));
       await documentsDb.updateDocument(document.id, {
         status: 'ready',
         embeddingStatus: 'indexed',
+        updatedAt: new Date().toISOString(),
+        error: null
+      });
+    } catch (error) {
+      failures.push({ documentId: document.id, error: error.message });
+      await documentsDb.updateDocument(document.id, {
+        embeddingStatus: 'failed',
+        error: error.message,
         updatedAt: new Date().toISOString()
       });
     }
   }
-  res.json({ indexedChunks: indexed.length, documentCount: documents.length, model: 'local-demo-hash-v1' });
+  res.json({
+    indexedChunks: indexed.length,
+    documentCount: documents.length,
+    failedDocuments: failures,
+    model: OLLAMA_EMBEDDING_MODEL
+  });
 });
 
 app.delete('/api/documents/:id', async (req, res) => {
@@ -662,7 +702,7 @@ app.post('/api/documents/:id/index', async (req, res) => {
       updatedAt: new Date().toISOString(),
       error: null
     });
-    res.json({ document, chunks, model: 'local-demo-hash-v1' });
+    res.json({ document, chunks, model: OLLAMA_EMBEDDING_MODEL });
   } catch (error) {
     document = await documentsDb.updateDocument(document.id, {
       embeddingStatus: 'failed',

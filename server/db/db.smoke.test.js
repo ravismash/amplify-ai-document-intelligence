@@ -109,8 +109,8 @@ test('chunks round-trip including embedding vector fidelity, and delete cascades
     chunkIndex: 0, characterStart: 0, characterEnd: 11, embeddingStatus: 'pending'
   }]);
 
-  const embedding = Array.from({ length: 64 }, (_, i) => Number((Math.sin(i) * 0.1).toFixed(6)));
-  await setChunkEmbeddings([{ id: chunkId, embedding, embeddingModel: 'local-demo-hash-v1', embeddingDimensions: 64, indexedAt: now }]);
+  const embedding = Array.from({ length: 768 }, (_, i) => Number((Math.sin(i) * 0.1).toFixed(6)));
+  await setChunkEmbeddings([{ id: chunkId, embedding, embeddingModel: 'nomic-embed-text', embeddingDimensions: 768, indexedAt: now }]);
 
   const indexed = await getIndexedChunks(null);
   const match = indexed.find((c) => c.id === chunkId);

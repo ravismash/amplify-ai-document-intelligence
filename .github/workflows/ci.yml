@@ -51,6 +51,17 @@ jobs:
             sleep 1
           done
 
+      # Ollama's image has no default command either, and needs a model pulled before use -
+      # same plain-step workaround as MinIO above.
+      - name: Start Ollama and pull embedding model
+        run: |
+          docker run -d --name ollama -p 11434:11434 ollama/ollama:latest serve
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:11434/api/tags && break
+            sleep 2
+          done
+          docker exec ollama ollama pull nomic-embed-text
+
       - name: Verify tests and production build
         run: npm run verify
         env:
@@ -59,6 +70,8 @@ jobs:
           OBJECT_STORE_ENDPOINT: http://localhost:9000
           OBJECT_STORE_ACCESS_KEY: amplify
           OBJECT_STORE_SECRET_KEY: amplify123
+          OLLAMA_HOST: http://localhost:11434
+          OLLAMA_EMBEDDING_MODEL: nomic-embed-text
 
       - name: Validate JavaScript syntax
         run: node --check server/server.js && node --check server/server.test.js

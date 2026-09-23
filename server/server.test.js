@@ -39,7 +39,10 @@ before(async () => {
       PORT: String(port),
       DATABASE_URL: testDatabaseUrl,
       OBJECT_STORE_BUCKET: testBucket,
-      OLLAMA_HOST: '',
+      // Real Ollama embeddings are exercised end to end (OLLAMA_HOST stays live), but chat
+      // generation is disabled so answers stay deterministic/extractive for assertions below -
+      // OLLAMA_MODEL follows the same explicit-empty-disables convention as OLLAMA_HOST.
+      OLLAMA_MODEL: '',
       ANTHROPIC_API_KEY: ''
     },
     stdio: ['ignore', 'pipe', 'pipe']

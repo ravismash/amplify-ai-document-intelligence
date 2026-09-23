@@ -22,7 +22,7 @@ Set up the working project skeleton and a professional UI shell so the team can 
 
 ## Local run
 
-Requires [Docker](https://www.docker.com/) for Postgres (with pgvector) and MinIO.
+Requires [Docker](https://www.docker.com/) for Postgres (with pgvector) and MinIO, and [Ollama](https://ollama.com/) running locally with `nomic-embed-text` pulled (`ollama pull nomic-embed-text`) - chunk/query embeddings call it directly, so `npm test` needs a real Ollama available, not just a mock.
 
 ```bash
 npm install
