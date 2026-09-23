@@ -1,0 +1,164 @@
+# Amplify AI Document Intelligence
+
+This project is the starting point for the AI consultancy PoC described in the project brief.
+
+## Day 1 goal
+
+Set up the working project skeleton and a professional UI shell so the team can begin building the core document intelligence workflow.
+
+## Deliverables for Day 1
+
+- Frontend app shell with dashboard layout
+- Backend API with health endpoint
+- Clear separation between client and server
+- Local development setup
+- Foundation for future document upload, retrieval, and reporting features
+
+## Stack
+
+- Frontend: React + Vite
+- Backend: Node + Express
+- Local development: workspace scripts
+
+## Local run
+
+```bash
+npm install
+npm run dev
+npm test --workspace server
+```
+
+Every push and pull request runs the same verification automatically through [CI](.github/workflows/ci.yml), including tests, the production build, syntax checks, and a high-severity dependency audit.
+
+Then open:
+
+- Frontend: http://localhost:5173
+- Backend: http://localhost:4000/api/health
+
+## 20-Day Delivery Plan
+
+### Day 1 - Project foundation (complete)
+
+- Set up the React/Vite client and Node/Express server
+- Create the dashboard application shell
+- Add the backend health endpoint
+- Establish separate client and server workspaces
+- Verify the local development workflow
+
+### Day 2 - Requirements and data model (complete)
+
+- Define document, extraction, chunk, query, citation, and report data shapes
+- Identify supported file types and size limits
+- Document the first end-to-end user workflow
+
+See [Day 2 requirements and data model](docs/day-2-requirements.md) for the detailed contracts and acceptance criteria.
+
+### Day 3 - Document upload experience (complete)
+
+- Add drag-and-drop and file picker upload controls
+- Show upload progress, success, and failure states
+- Validate file type and file size on the client
+
+### Day 4 - Upload API and metadata storage (complete)
+
+- Implement the document upload API
+- Store document metadata and processing status
+- Add document list and detail endpoints
+
+### Day 5 - Text extraction (complete)
+
+- Extract text from supported text and PDF files
+- Persist extraction results and processing errors
+- Add an extraction status to the document workflow
+
+### Day 6 - OCR support (complete)
+
+- Add OCR processing for scanned documents
+- Normalize OCR output and retain page references
+- Surface OCR confidence and failures where available
+
+### Day 7 - Text preparation (complete)
+
+- Clean and normalize extracted text
+- Split documents into traceable chunks
+- Preserve document, page, and section metadata for citations
+
+### Day 8 - Embedding pipeline (complete)
+
+- Select and configure the embedding provider
+- Generate embeddings for document chunks
+- Track embedding status and retryable failures
+
+### Day 9 - Retrieval index (complete)
+
+- Add a vector index for document chunks
+- Index new and updated documents
+- Support deletion and re-indexing of document content
+
+### Day 10 - Retrieval quality (complete)
+
+
+See [Day 10 retrieval quality](docs/day-10-retrieval-quality.md) for the evaluation contract and metrics.
+
+- Add request validation and response status handling
+### Day 11 - Question answering API (complete)
+- Prevent answers from using unrelated document content
+
+### Day 12 - Citations and evidence (complete)
+
+- Attach document and page citations to every answer
+- Return supporting excerpts with stable references
+- Handle questions with insufficient evidence explicitly
+
+### Day 13 - Question answering interface (complete)
+
+- Add the question and answer workflow to the client
+- Display loading, empty, error, and no-evidence states
+- Make citations open the relevant document context
+
+### Day 14 - Report generation (complete)
+
+- Define report sections and output formats
+- Generate reports from documents, answers, and citations
+- Add report status and download behavior
+
+### Day 15 - Dashboard workflow (complete)
+
+- Connect document, processing, query, and report views
+- Add search, filtering, and sorting for documents
+- Show processing and reporting progress at a glance
+
+### Day 16 - Security and access controls (complete)
+
+- Validate all API inputs and uploaded content
+- Protect secrets and environment-specific configuration
+- Add basic access boundaries for documents and reports
+
+### Day 17 - Reliability and observability (complete)
+
+- Add structured server logging and request correlation
+- Add retries for transient processing failures
+- Provide actionable error messages and recovery actions
+
+### Day 18 - Automated testing (complete)
+
+- Add unit tests for parsing, chunking, retrieval, and citations
+- Add API tests for upload, processing, querying, and reports
+- Add client tests for the primary document workflow
+
+### Day 19 - Integration and release readiness (complete)
+
+- Run the complete end-to-end workflow with representative documents
+- Test large files, OCR failures, empty results, and service errors
+- Review performance, accessibility, and responsive behavior
+
+See [Day 19 release readiness](docs/day-19-release-readiness.md) for the verification checklist.
+
+### Day 20 - Final polish and handoff (complete)
+
+- Fix release-blocking issues and refine the dashboard experience
+- Update setup, API, and workflow documentation
+- Prepare a demo dataset and acceptance checklist
+- Verify the final build and handoff the project
+
+See [Day 20 final handoff](docs/day-20-final-handoff.md) for the demo runbook, acceptance checklist, and production boundary.

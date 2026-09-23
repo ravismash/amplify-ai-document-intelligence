@@ -1,0 +1,14 @@
+{
+  "name": "amplify-ai-document-intelligence",
+  "private": true,
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev --workspace server",
+    "dev:client": "npm run dev --workspace client",
+    "dev": "npm run dev:server & npm run dev:client",
+    "verify": "npm test --workspace server && npm run build --workspace client"
+  }
+}
