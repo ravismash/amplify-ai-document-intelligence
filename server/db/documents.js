@@ -29,9 +29,22 @@ export async function insertDocument(document) {
   return rowToDocument(rows[0]);
 }
 
-export async function getAllDocuments() {
-  const { rows } = await getPool().query('SELECT * FROM documents ORDER BY uploaded_at DESC');
+// `limit`/`offset` are only passed by the listing route (GET /api/documents) for real pagination.
+// Every other caller (citation lookups, report generation, index rebuild) needs the complete set
+// to stay correct, so both are opt-in, not a default.
+export async function getAllDocuments(limit = null, offset = 0) {
+  const { rows } = await getPool().query(
+    limit ? 'SELECT * FROM documents ORDER BY uploaded_at DESC LIMIT $1 OFFSET $2' : 'SELECT * FROM documents ORDER BY uploaded_at DESC',
+    limit ? [limit, offset] : []
+  );
   return rows.map(rowToDocument);
+}
+
+export async function getDocumentCounts() {
+  const { rows } = await getPool().query(
+    `SELECT count(*) AS total, count(*) FILTER (WHERE embedding_status = 'indexed') AS indexed FROM documents`
+  );
+  return { total: Number(rows[0].total), indexed: Number(rows[0].indexed) };
 }
 
 export async function getDocumentById(id) {

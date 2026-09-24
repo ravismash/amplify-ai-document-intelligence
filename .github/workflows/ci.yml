@@ -85,7 +85,14 @@ jobs:
           REDIS_URL: redis://localhost:6379
 
       - name: Validate JavaScript syntax
-        run: node --check server/server.js && node --check server/server.test.js && node --check server/auth.js && node --check server/worker.js && node --check server/queue.js && node --check server/processing.js && node --check server/logger.js && node --check server/metrics.js
+        run: node --check server/server.js && node --check server/server.test.js && node --check server/auth.js && node --check server/worker.js && node --check server/queue.js && node --check server/processing.js && node --check server/logger.js && node --check server/metrics.js && node --check server/rateLimit.js
 
-      - name: Audit production dependencies
-        run: npm audit --omit=dev --audit-level=high
+      # No --omit=dev: client's build tooling (vite/esbuild) is a devDependency but still runs on
+      # every contributor's machine, so a vulnerability there is real, not just theoretical.
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Scan for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

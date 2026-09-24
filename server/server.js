@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import Anthropic from '@anthropic-ai/sdk';
@@ -19,6 +20,7 @@ import { OLLAMA_HOST, OLLAMA_EMBEDDING_MODEL, normalizeText, withRetry, embedTex
 import { extractQueue, ocrQueue, indexQueue, checkRedisHealth } from './queue.js';
 import { logEvent } from './logger.js';
 import { register, httpRequestDuration, refreshQueueMetrics } from './metrics.js';
+import { loginLimiter, llmRouteLimiter, uploadLimiter, rebuildLimiter } from './rateLimit.js';
 
 dotenv.config();
 
@@ -33,6 +35,11 @@ const ANSWER_MODEL = 'claude-sonnet-5';
 const anthropicClient = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL !== undefined ? process.env.OLLAMA_MODEL.trim() : 'llama3.1';
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map((origin) => origin.trim());
+const MAX_QUESTION_LENGTH = 2000;
+const MAX_DOCUMENT_IDS = 100;
+const MAX_EVALUATION_CASES = 20;
+const MAX_LISTING_ROWS = 500;
+const DEFAULT_PAGE_SIZE = 50;
 const fileLimitsMb = {
   'application/pdf': 25,
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 25,
@@ -240,16 +247,13 @@ const upload = multer({
   }
 });
 
-app.disable('x-powered-by');
+app.use(helmet());
 app.use(cors({ origin: allowedOrigins }));
 app.use(express.json({ limit: '100kb' }));
 app.use((req, res, next) => {
   const requestId = req.get('x-request-id') || randomUUID();
   const startedAt = Date.now();
   res.setHeader('x-request-id', requestId);
-  res.setHeader('x-content-type-options', 'nosniff');
-  res.setHeader('x-frame-options', 'DENY');
-  res.setHeader('referrer-policy', 'no-referrer');
   res.on('finish', () => {
     const durationMs = Date.now() - startedAt;
     const route = req.route?.path || 'unmatched';
@@ -302,7 +306,7 @@ function requireAuth(req, res, next) {
 
 app.use('/api', requireAuth);
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
   const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
   if (!username || !password) {
@@ -348,7 +352,13 @@ app.get('/api/summary', (req, res) => {
 });
 
 app.get('/api/documents', async (req, res) => {
-  res.json({ documents: await documentsDb.getAllDocuments() });
+  const limit = Math.min(Math.max(Number(req.query.limit) || DEFAULT_PAGE_SIZE, 1), MAX_LISTING_ROWS);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const [documents, counts] = await Promise.all([
+    documentsDb.getAllDocuments(limit, offset),
+    documentsDb.getDocumentCounts()
+  ]);
+  res.json({ documents, total: counts.total, indexedCount: counts.indexed, limit, offset });
 });
 
 app.get('/api/documents/:id', async (req, res) => {
@@ -378,7 +388,7 @@ app.get('/api/documents/:id/chunks', async (req, res) => {
   res.json({ chunks: await chunksDb.getChunksByDocumentId(req.params.id) });
 });
 
-app.post('/api/search', async (req, res) => {
+app.post('/api/search', llmRouteLimiter, async (req, res) => {
   const query = typeof req.body?.query === 'string' ? normalizeText(req.body.query) : '';
   const requestedLimit = Number(req.body?.limit) || 5;
   const limit = Math.min(Math.max(requestedLimit, 1), 20);
@@ -387,15 +397,27 @@ app.post('/api/search', async (req, res) => {
     res.status(400).json({ error: 'A non-empty query is required' });
     return;
   }
+  if (query.length > MAX_QUESTION_LENGTH) {
+    res.status(400).json({ error: `Query exceeds the ${MAX_QUESTION_LENGTH} character limit` });
+    return;
+  }
+  if (documentIds && documentIds.length > MAX_DOCUMENT_IDS) {
+    res.status(400).json({ error: `Too many document IDs (max ${MAX_DOCUMENT_IDS})` });
+    return;
+  }
 
   const results = await searchChunks(query, documentIds, limit);
   res.json({ query, results, index: OLLAMA_EMBEDDING_MODEL });
 });
 
-app.post('/api/search/evaluate', async (req, res) => {
+app.post('/api/search/evaluate', llmRouteLimiter, async (req, res) => {
   const cases = Array.isArray(req.body?.cases) ? req.body.cases : [];
   if (!cases.length) {
     res.status(400).json({ error: 'At least one evaluation case is required' });
+    return;
+  }
+  if (cases.length > MAX_EVALUATION_CASES) {
+    res.status(400).json({ error: `Too many evaluation cases (max ${MAX_EVALUATION_CASES})` });
     return;
   }
   const evaluations = await Promise.all(cases.map(async (evaluationCase) => {
@@ -422,11 +444,19 @@ app.post('/api/search/evaluate', async (req, res) => {
   });
 });
 
-app.post('/api/questions', async (req, res) => {
+app.post('/api/questions', llmRouteLimiter, async (req, res) => {
   const question = typeof req.body?.question === 'string' ? normalizeText(req.body.question) : '';
   const documentIds = Array.isArray(req.body?.documentIds) ? req.body.documentIds : null;
   if (!question) {
     res.status(400).json({ error: 'A non-empty question is required' });
+    return;
+  }
+  if (question.length > MAX_QUESTION_LENGTH) {
+    res.status(400).json({ error: `Question exceeds the ${MAX_QUESTION_LENGTH} character limit` });
+    return;
+  }
+  if (documentIds && documentIds.length > MAX_DOCUMENT_IDS) {
+    res.status(400).json({ error: `Too many document IDs (max ${MAX_DOCUMENT_IDS})` });
     return;
   }
 
@@ -490,6 +520,10 @@ app.post('/api/reports', async (req, res) => {
   const title = typeof req.body?.title === 'string' && req.body.title.trim() ? req.body.title.trim() : 'Document intelligence report';
   const queryIds = Array.isArray(req.body?.queryIds) ? req.body.queryIds : [];
   const documentIds = Array.isArray(req.body?.documentIds) ? req.body.documentIds : [];
+  if (queryIds.length > MAX_DOCUMENT_IDS || documentIds.length > MAX_DOCUMENT_IDS) {
+    res.status(400).json({ error: `Too many IDs (max ${MAX_DOCUMENT_IDS})` });
+    return;
+  }
   const queries = queryIds.length ? await queriesDb.getQueriesByIds(queryIds) : [];
   const documents = (await documentsDb.getAllDocuments()).filter((document) => documentIds.includes(document.id));
   if (!queries.length && !documents.length) {
@@ -525,7 +559,13 @@ app.post('/api/reports', async (req, res) => {
 });
 
 app.get('/api/reports', async (req, res) => {
-  res.json({ reports: (await reportsDb.getAllReports()).map(({ content, ...report }) => report) });
+  const limit = Math.min(Math.max(Number(req.query.limit) || DEFAULT_PAGE_SIZE, 1), MAX_LISTING_ROWS);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const [reports, total] = await Promise.all([
+    reportsDb.getAllReports(limit, offset),
+    reportsDb.countReports()
+  ]);
+  res.json({ reports: reports.map(({ content, ...report }) => report), total, limit, offset });
 });
 
 app.get('/api/reports/:id/download', async (req, res) => {
@@ -537,18 +577,20 @@ app.get('/api/reports/:id/download', async (req, res) => {
   res.type('text/markdown').attachment(`${report.id}.md`).send(report.content);
 });
 
-app.post('/api/index/rebuild', async (req, res) => {
+app.post('/api/index/rebuild', rebuildLimiter, async (req, res) => {
   const documents = await documentsDb.getAllDocuments();
   let enqueued = 0;
+  let skipped = 0;
   for (const document of documents) {
     if (['queued', 'processing'].includes(document.embeddingStatus)) continue;
+    if (enqueued >= MAX_LISTING_ROWS) { skipped += 1; continue; }
     const existingChunks = await chunksDb.getChunksByDocumentId(document.id);
     if (!existingChunks.length) continue;
     await documentsDb.updateDocument(document.id, { embeddingStatus: 'queued', updatedAt: new Date().toISOString(), error: null });
     await indexQueue.add('index', { documentId: document.id }, { jobId: document.id });
     enqueued += 1;
   }
-  res.status(202).json({ enqueued, documentCount: documents.length, model: OLLAMA_EMBEDDING_MODEL });
+  res.status(202).json({ enqueued, skipped, documentCount: documents.length, model: OLLAMA_EMBEDDING_MODEL });
 });
 
 app.delete('/api/documents/:id', async (req, res) => {
@@ -594,7 +636,7 @@ const extensionByMimeType = {
   'text/csv': '.csv'
 };
 
-app.post('/api/documents', upload.single('file'), async (req, res) => {
+app.post('/api/documents', uploadLimiter, upload.single('file'), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: 'A document file is required' });
     return;

@@ -57,6 +57,13 @@ npm run observability:up
 
 Then open Grafana at http://localhost:3000 (default login `admin`/`admin`, or set `GRAFANA_ADMIN_PASSWORD`) - the Prometheus datasource and the "Amplify AI Overview" dashboard are both auto-provisioned from files in `observability/`, no manual setup required.
 
+## Security
+
+- **Rate limiting** (Redis-backed, per IP, survives restarts): login is capped at 10 attempts/15 min (brute-force protection); `/api/questions`, `/api/search`, and `/api/search/evaluate` at 60/15 min (LLM/embedding cost abuse); document upload at 30/15 min; `/api/index/rebuild` at 5/15 min. All configurable via env vars (see `server/.env.example`). Plain reads and the already-queued single-document extract/OCR/index routes are deliberately left unlimited - they're cheap and already guarded by Phase 4's double-submission check and bounded queue concurrency.
+- **Input caps**: `documentIds`/`queryIds` arrays are capped at 100 entries, questions/queries at 2000 characters, and `/api/search/evaluate`'s `cases` array at 20 entries. `GET /api/documents` and `GET /api/reports` are capped at 500 rows as a defensive backstop against unbounded growth (not full pagination - a future improvement if the corpus grows past that).
+- **Headers**: `helmet` sets CSP, HSTS, and the standard hardening headers on every response.
+- **Dependency scanning**: CI runs `npm audit --audit-level=high` across the full dependency tree (including devDependencies, closing a gap where client build-tooling vulnerabilities were previously invisible to the gate) and `gitleaks` on every push/PR for secret scanning. A full-history scan (`gitleaks detect --source .`) was also run manually and found nothing.
+
 ## 20-Day Delivery Plan
 
 ### Day 1 - Project foundation (complete)

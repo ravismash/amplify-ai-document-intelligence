@@ -20,12 +20,15 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0",
     "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.4.0",
     "pdf-parse": "^1.1.1",
     "pg": "^8.13.0",
     "pgvector": "^0.2.0",
+    "rate-limit-redis": "^6.0.1",
     "tesseract.js": "^7.0.0"
   }
 }

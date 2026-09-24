@@ -26,9 +26,17 @@ export async function insertReport(report) {
   return rowToReport(rows[0]);
 }
 
-export async function getAllReports() {
-  const { rows } = await getPool().query('SELECT * FROM reports ORDER BY created_at DESC');
+export async function getAllReports(limit = null, offset = 0) {
+  const { rows } = await getPool().query(
+    limit ? 'SELECT * FROM reports ORDER BY created_at DESC LIMIT $1 OFFSET $2' : 'SELECT * FROM reports ORDER BY created_at DESC',
+    limit ? [limit, offset] : []
+  );
   return rows.map(rowToReport);
+}
+
+export async function countReports() {
+  const { rows } = await getPool().query('SELECT count(*) FROM reports');
+  return Number(rows[0].count);
 }
 
 export async function getReportById(id) {

@@ -20,6 +20,7 @@ const testJwtSecret = process.env.JWT_SECRET || 'test-jwt-secret-for-local-devel
 const testUsername = 'test-user';
 const testPassword = 'Test-Password-123!';
 const testQueuePrefix = `amplify_test_${randomUUID().replace(/-/g, '_')}`;
+const testRateLimitPrefix = `rl_test_${randomUUID().replace(/-/g, '_')}`;
 
 let serverProcess;
 let workerProcess;
@@ -57,11 +58,21 @@ before(async () => {
     JWT_SECRET: testJwtSecret,
     REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379',
     QUEUE_PREFIX: testQueuePrefix,
+    RATE_LIMIT_KEY_PREFIX: testRateLimitPrefix,
     // Real Ollama embeddings are exercised end to end (OLLAMA_HOST stays live), but chat
     // generation is disabled so answers stay deterministic/extractive for assertions below -
     // OLLAMA_MODEL follows the same explicit-empty-disables convention as OLLAMA_HOST.
     OLLAMA_MODEL: '',
-    ANTHROPIC_API_KEY: ''
+    ANTHROPIC_API_KEY: '',
+    // Rate-limit counters live in Redis, not this test's scratch DB, so they persist across
+    // separate `npm test` runs within the same window - effectively unlimited here so ordinary
+    // functional tests (which upload/query far more than a real user would in 15 minutes) never
+    // trip a limiter. The dedicated rate-limit test below spawns its own process with low
+    // thresholds instead, so the actual throttling behavior still gets exercised for real.
+    LOGIN_RATE_LIMIT_MAX: '100000',
+    LLM_RATE_LIMIT_MAX: '100000',
+    UPLOAD_RATE_LIMIT_MAX: '100000',
+    REBUILD_RATE_LIMIT_MAX: '100000'
   };
 
   serverProcess = spawn(process.execPath, ['server.js'], {
@@ -283,6 +294,70 @@ test('validation and negative paths return safe errors', async () => {
   await request(`/api/documents/${textDocumentId}`, { method: 'DELETE' });
 });
 
+test('GET /api/documents paginates with limit/offset and reports an accurate total', async () => {
+  await waitForServer();
+
+  // Baseline first, since the shared test DB accumulates rows from other tests in this file -
+  // asserting a delta rather than an absolute total keeps this robust regardless of test order.
+  const before = await request('/api/documents?limit=1&offset=0');
+  const baselineTotal = before.body.total;
+
+  const uploadedIds = [];
+  for (let i = 0; i < 3; i += 1) {
+    const form = new FormData();
+    form.append('file', new Blob([`Pagination test document ${i}.`], { type: 'text/plain' }), `pagination-${i}.txt`);
+    const upload = await request('/api/documents', { method: 'POST', body: form });
+    uploadedIds.push(upload.body.document.id);
+  }
+
+  const afterUpload = await request('/api/documents?limit=1&offset=0');
+  assert.equal(afterUpload.body.total, baselineTotal + 3, 'total must reflect every row, not just the current page');
+
+  const fullLimit = baselineTotal + 3;
+  const page1 = await request(`/api/documents?limit=${Math.ceil(fullLimit / 2)}&offset=0`);
+  const page2 = await request(`/api/documents?limit=${fullLimit}&offset=${page1.body.documents.length}`);
+  assert.equal(page1.body.documents.length, Math.min(Math.ceil(fullLimit / 2), fullLimit));
+  const combinedIds = [...page1.body.documents, ...page2.body.documents].map((document) => document.id);
+  assert.equal(new Set(combinedIds).size, combinedIds.length, 'paginated results must not overlap across pages');
+  for (const id of uploadedIds) assert.ok(combinedIds.includes(id), `uploaded document ${id} must appear exactly once across all pages`);
+
+  assert.ok(Number.isInteger(afterUpload.body.indexedCount) && afterUpload.body.indexedCount >= 0);
+
+  for (const id of uploadedIds) await request(`/api/documents/${id}`, { method: 'DELETE' });
+});
+
+test('GET /api/reports paginates with limit/offset and reports an accurate total', async () => {
+  await waitForServer();
+
+  const form = new FormData();
+  form.append('file', new Blob(['Pagination test source document.'], { type: 'text/plain' }), 'pagination-report-source.txt');
+  const upload = await request('/api/documents', { method: 'POST', body: form });
+  const documentId = upload.body.document.id;
+
+  const before = await request('/api/reports?limit=1&offset=0');
+  const baselineTotal = before.body.total;
+
+  const createdReportIds = [];
+  for (let i = 0; i < 2; i += 1) {
+    const report = await request('/api/reports', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: `Pagination test report ${i}`, documentIds: [documentId] })
+    });
+    createdReportIds.push(report.body.id);
+  }
+
+  const afterCreate = await request('/api/reports?limit=1&offset=0');
+  assert.equal(afterCreate.body.total, baselineTotal + 2, 'total must reflect every row, not just the current page');
+
+  const onlyFirst = await request('/api/reports?limit=1&offset=0');
+  assert.equal(onlyFirst.body.reports.length, 1);
+  assert.equal(onlyFirst.body.limit, 1);
+  assert.equal(onlyFirst.body.offset, 0);
+
+  await request(`/api/documents/${documentId}`, { method: 'DELETE' });
+});
+
 test('concurrent extraction does not lose document updates', async () => {
   await waitForServer();
 
@@ -383,6 +458,44 @@ test('malformed request bodies get safe generic errors, not leaked internals', a
   assert.equal(oversizedBody.error, 'Request payload is too large');
 });
 
+test('oversized documentIds/queryIds arrays and long questions are rejected', async () => {
+  await waitForServer();
+
+  const tooManyIds = Array.from({ length: 101 }, (_, i) => `doc_${i}`);
+  const tooManyDocIds = await request('/api/questions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ question: 'test', documentIds: tooManyIds })
+  });
+  assert.equal(tooManyDocIds.response.status, 400);
+
+  const tooLongQuestion = await request('/api/questions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ question: 'a'.repeat(2001) })
+  });
+  assert.equal(tooLongQuestion.response.status, 400);
+
+  const tooManyCases = await request('/api/search/evaluate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cases: Array.from({ length: 21 }, () => ({ query: 'test' })) })
+  });
+  assert.equal(tooManyCases.response.status, 400);
+});
+
+test('security headers are present and the origin allowlist is enforced', async () => {
+  await waitForServer();
+
+  const response = await fetch(`${baseUrl}/api/health`);
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.ok(response.headers.get('content-security-policy'), 'CSP header must be present');
+  assert.equal(response.headers.get('x-powered-by'), null);
+
+  const disallowedOrigin = await fetch(`${baseUrl}/api/health`, { headers: { origin: 'http://evil.example.com' } });
+  assert.notEqual(disallowedOrigin.headers.get('access-control-allow-origin'), 'http://evil.example.com');
+});
+
 test('a NUL byte in user input does not crash the server', async () => {
   await waitForServer();
 
@@ -462,6 +575,61 @@ test('an unreachable database degrades to a clean error instead of crashing the 
   }
 });
 
+test('repeated failed logins are rate limited', async () => {
+  // A dedicated instance with a low threshold and its own Redis key prefix - isolated from the
+  // shared serverProcess's counters (which are set effectively unlimited above specifically so
+  // this test's deliberate exhaustion doesn't bleed into every other test that calls /auth/login).
+  const rateLimitedPort = 4103;
+  const rateLimitedBaseUrl = `http://localhost:${rateLimitedPort}`;
+  const rateLimitedProcess = spawn(process.execPath, ['server.js'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      PORT: String(rateLimitedPort),
+      DATABASE_URL: testDatabaseUrl,
+      OBJECT_STORE_BUCKET: testBucket,
+      JWT_SECRET: testJwtSecret,
+      REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379',
+      QUEUE_PREFIX: testQueuePrefix,
+      RATE_LIMIT_KEY_PREFIX: `${testRateLimitPrefix}_dedicated`,
+      LOGIN_RATE_LIMIT_MAX: '3',
+      OLLAMA_MODEL: '',
+      ANTHROPIC_API_KEY: ''
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  try {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      try {
+        const response = await fetch(`${rateLimitedBaseUrl}/api/health`);
+        if (response.ok) break;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const response = await fetch(`${rateLimitedBaseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: testUsername, password: 'wrong-password' })
+      });
+      assert.equal(response.status, 401, `attempt ${attempt} should fail on credentials, not be rate limited yet`);
+    }
+
+    const throttled = await fetch(`${rateLimitedBaseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: testUsername, password: 'wrong-password' })
+    });
+    assert.equal(throttled.status, 429);
+    assert.ok(throttled.headers.get('ratelimit-limit'), 'RateLimit-* headers must be present on a throttled response');
+  } finally {
+    rateLimitedProcess.kill('SIGTERM');
+    await once(rateLimitedProcess, 'exit');
+  }
+});
+
 after(async () => {
   serverProcess.kill('SIGTERM');
   await once(serverProcess, 'exit');
@@ -473,7 +641,10 @@ after(async () => {
   // local `npm test` runs would leave orphaned BullMQ keys under a fresh testQueuePrefix forever.
   const Redis = (await import('ioredis')).default;
   const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
-  const keys = await redis.keys(`${testQueuePrefix}:*`);
+  const keys = [
+    ...(await redis.keys(`${testQueuePrefix}:*`)),
+    ...(await redis.keys(`${testRateLimitPrefix}*`))
+  ];
   if (keys.length) await redis.del(...keys);
   await redis.quit();
 

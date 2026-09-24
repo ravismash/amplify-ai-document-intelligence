@@ -131,6 +131,8 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const fileInputRef = useRef(null);
   const [documents, setDocuments] = useState([]);
+  const [documentsTotal, setDocumentsTotal] = useState(0);
+  const [indexedCount, setIndexedCount] = useState(0);
 
   const visibleDocuments = documents
     .filter((document) => document.name.toLowerCase().includes(documentSearch.toLowerCase()))
@@ -176,13 +178,23 @@ export default function App() {
   useEffect(() => {
     if (!token) return;
 
-    apiFetch(`${API_BASE}/api/documents`)
+    apiFetch(`${API_BASE}/api/documents?limit=50&offset=0`)
       .then((res) => res.json())
       .then((data) => {
-        if (data.documents?.length) setDocuments(data.documents.map((document) => ({ ...document, status: displayStatus(document.status) })));
+        setDocuments((data.documents || []).map((document) => ({ ...document, status: displayStatus(document.status) })));
+        setDocumentsTotal(data.total || 0);
+        setIndexedCount(data.indexedCount || 0);
       })
       .catch(() => {});
   }, [token]);
+
+  async function handleLoadMoreDocuments() {
+    const response = await apiFetch(`${API_BASE}/api/documents?limit=50&offset=${documents.length}`);
+    const data = await response.json();
+    setDocuments((current) => [...current, ...(data.documents || []).map((document) => ({ ...document, status: displayStatus(document.status) }))]);
+    setDocumentsTotal(data.total || 0);
+    setIndexedCount(data.indexedCount || 0);
+  }
 
   async function handleExtract(documentId) {
     setExtractingId(documentId);
@@ -289,10 +301,15 @@ export default function App() {
   async function handleGenerateReport() {
     setReportState({ status: 'generating', message: 'Generating report...' });
     try {
+      // Fetched fresh rather than filtered from local `documents` state, which may only hold the
+      // currently-loaded page - this must always cover the whole corpus, not just what's visible.
+      const allDocsResponse = await apiFetch(`${API_BASE}/api/documents?limit=${documentsTotal || 500}&offset=0`);
+      const allDocsData = await allDocsResponse.json();
+      const documentIds = (allDocsData.documents || []).filter((document) => document.id.toString().startsWith('doc_')).map((document) => document.id);
       const response = await apiFetch(`${API_BASE}/api/reports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'Document intelligence findings', documentIds: documents.filter((document) => document.id.toString().startsWith('doc_')).map((document) => document.id) })
+        body: JSON.stringify({ title: 'Document intelligence findings', documentIds })
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Report generation failed');
@@ -418,7 +435,7 @@ export default function App() {
         <section className="overview-grid" id="overview-section">
           <div className="metric-card">
             <span>Total docs</span>
-            <strong>{documents.length}</strong>
+            <strong>{documentsTotal}</strong>
           </div>
           <div className="metric-card">
             <span>Questions answered</span>
@@ -430,7 +447,7 @@ export default function App() {
           </div>
           <div className="metric-card">
             <span>Accuracy score</span>
-            <strong>{documents.filter((document) => document.embeddingStatus === 'indexed').length ? 'Indexed' : 'Pending'}</strong>
+            <strong>{indexedCount > 0 ? 'Indexed' : 'Pending'}</strong>
           </div>
         </section>
 
@@ -508,6 +525,11 @@ export default function App() {
               ))}
             </ul>
             {visibleDocuments.length === 0 && <p className="chat-empty">No documents match the current filters.</p>}
+            {documents.length < documentsTotal && (
+              <button className="extract-button" onClick={handleLoadMoreDocuments} type="button">
+                Load more ({documents.length} of {documentsTotal})
+              </button>
+            )}
           </div>
 
           <div className="panel chat-panel" id="search-section">
