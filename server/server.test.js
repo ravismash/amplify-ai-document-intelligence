@@ -795,7 +795,7 @@ async function startMockAnthropic(replyFor) {
 
 // Real-LLM tests need a local chat model. CI only pulls the embedding model (a multi-GB chat model
 // on a CPU-only runner is impractically slow), so these skip - visibly - when it isn't installed.
-const chatModel = process.env.TEST_OLLAMA_CHAT_MODEL || 'llama3.1';
+const chatModel = process.env.TEST_OLLAMA_CHAT_MODEL || 'qwen2.5:14b';
 async function chatModelSkipReason() {
   try {
     const { models = [] } = await (await fetch(`${process.env.OLLAMA_HOST || 'http://localhost:11434'}/api/tags`)).json();

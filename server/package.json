@@ -10,6 +10,7 @@
     "migrate:data": "node scripts/migrate-json-to-postgres.js",
     "create-user": "node scripts/create-user.js",
     "worker": "node worker.js",
+    "eval": "node scripts/eval-answers.js",
     "test": "node --test server.test.js prompt.test.js auth.test.js db/db.smoke.test.js"
   },
   "dependencies": {

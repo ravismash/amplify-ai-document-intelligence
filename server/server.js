@@ -33,7 +33,7 @@ if (!process.env.JWT_SECRET?.trim()) {
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY?.trim() || '';
 const ANSWER_MODEL = 'claude-sonnet-5';
 const anthropicClient = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL !== undefined ? process.env.OLLAMA_MODEL.trim() : 'llama3.1';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL !== undefined ? process.env.OLLAMA_MODEL.trim() : 'qwen2.5:14b';
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map((origin) => origin.trim());
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_DOCUMENT_IDS = 100;
@@ -67,23 +67,7 @@ function searchTerms(text) {
 }
 
 function expandedSearchTerms(text) {
-  const synonyms = {
-    technology: ['java', 'node', 'microservice', 'rdbms', 'nosql', 'oracle', 'react', 'jdbc'],
-    skill: ['expertise', 'skilled', 'developed', 'designed', 'implemented'],
-    skillset: ['skill', 'expertise', 'skilled', 'developed', 'designed', 'implemented'],
-    leadership: ['led', 'lead', 'managed', 'mentored', 'team', 'spearheaded', 'scrum'],
-    experience: ['employment', 'career', 'worked', 'designed', 'developed', 'implemented'],
-    company: ['employment', 'employer', 'organization', 'staff', 'senior', 'engineer', 'celigo', 'citrix', 'netscaler'],
-    frontend: ['react', 'web', 'presentation', 'internal'],
-    database: ['rdbms', 'nosql', 'oracle', 'database', 'microservice'],
-    backend: ['java', 'node', 'microservice', 'rdbms', 'oracle'],
-    project: ['feature', 'service', 'microservice', 'implementation']
-  };
-  const terms = new Set(searchTerms(text));
-  for (const term of [...terms]) {
-    for (const synonym of synonyms[term] || []) terms.add(synonym);
-  }
-  return terms;
+  return new Set(searchTerms(text));
 }
 
 function cosineSimilarity(left, right) {
@@ -108,15 +92,13 @@ async function removeDocumentData(documentId) {
   return document;
 }
 
-// For a small, focused set of documents (the common case: a resume, a report), include every
-// indexed chunk in scope so multi-part or "list everything" questions aren't cut off by an
-// arbitrary top-K. For a large corpus, fall back to a bounded top-K to control cost and latency.
-async function resolveRetrievalLimit(documentIds) {
-  const minLimit = 5;
-  const maxLimit = 15;
-  const candidates = await chunksDb.getIndexedChunks(documentIds);
-  return Math.min(Math.max(candidates.length, minLimit), maxLimit);
-}
+// How many top-ranked excerpts the answer model reads. Measured on eval/questions.json with
+// qwen2.5:14b: 6 scored 15/18 because the correct clause sometimes ranked just outside the
+// window (this demo corpus has only ~11 chunks total, so a handful of lexically-similar but
+// wrong chunks is enough to push it out) - the model then answered from a related but incorrect
+// clause instead of refusing. 11 (near-total recall for this corpus) scored 17/18 at a real but
+// acceptable latency cost. Re-run `node scripts/eval-answers.js` before changing this.
+const ANSWER_CONTEXT_CHUNKS = Number(process.env.ANSWER_CONTEXT_CHUNKS) || 11;
 
 async function searchChunks(query, documentIds = null, limit = 5) {
   const [queryEmbedding] = await embedTexts([query], 'search_query: ');
@@ -216,10 +198,15 @@ async function generateGroundedAnswer(query, results) {
     try {
       const text = await withRetry(() => provider.call(system, user), 1);
       if (isNotFoundResponse(text)) return null;
+      // The prompt asks for [n] markers; only those excerpts become citations. If the model gave
+      // none, fall back to the top-ranked excerpt rather than citing everything it was shown.
+      const citedIndexes = [...new Set([...text.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]) - 1))]
+        .filter((index) => index >= 0 && index < results.length);
+      const citedResults = citedIndexes.length ? citedIndexes.map((index) => results[index]) : results.slice(0, 1);
       return {
         text,
         model: provider.name,
-        evidence: results.map((result) => ({
+        evidence: citedResults.map((result) => ({
           chunkId: result.chunkId,
           documentId: result.documentId,
           pageNumber: result.pageNumber,
@@ -471,8 +458,7 @@ app.post('/api/questions', llmRouteLimiter, async (req, res) => {
     citations: [],
     createdAt: new Date().toISOString()
   };
-  const retrievalLimit = await resolveRetrievalLimit(documentIds);
-  const results = await searchChunks(question, documentIds, retrievalLimit);
+  const results = await searchChunks(question, documentIds, ANSWER_CONTEXT_CHUNKS);
   let answer = null;
   let generationFailed = true;
   try {
