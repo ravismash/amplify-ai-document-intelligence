@@ -72,9 +72,10 @@ jobs:
           OBJECT_STORE_SECRET_KEY: amplify123
           OLLAMA_HOST: http://localhost:11434
           OLLAMA_EMBEDDING_MODEL: nomic-embed-text
+          JWT_SECRET: test-only-secret-for-ci
 
       - name: Validate JavaScript syntax
-        run: node --check server/server.js && node --check server/server.test.js
+        run: node --check server/server.js && node --check server/server.test.js && node --check server/auth.js
 
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high

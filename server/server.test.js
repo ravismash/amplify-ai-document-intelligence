@@ -4,8 +4,10 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { test, before, after } from 'node:test';
 import pg from 'pg';
+import jwt from 'jsonwebtoken';
 import { S3Client, CreateBucketCommand, ListObjectsV2Command, DeleteObjectCommand, DeleteBucketCommand } from '@aws-sdk/client-s3';
 import { runMigrations } from './db/migrate.js';
+import { closePool } from './db/pool.js';
 
 const port = 4100;
 const baseUrl = `http://localhost:${port}`;
@@ -14,15 +16,29 @@ const adminUrl = process.env.TEST_ADMIN_DATABASE_URL || 'postgresql://amplify:am
 const testDbName = `amplify_ai_test_${randomUUID().replace(/-/g, '_')}`;
 const testDatabaseUrl = adminUrl.replace(/\/[^/]*$/, `/${testDbName}`);
 const testBucket = `documents-test-${randomUUID()}`;
+const testJwtSecret = process.env.JWT_SECRET || 'test-jwt-secret-for-local-development-only';
+const testUsername = 'test-user';
+const testPassword = 'Test-Password-123!';
 
 let serverProcess;
+let authToken;
 
 before(async () => {
   const admin = new pg.Client({ connectionString: adminUrl });
   await admin.connect();
   await admin.query(`CREATE DATABASE ${testDbName}`);
   await admin.end();
+  process.env.DATABASE_URL = testDatabaseUrl;
   await runMigrations(testDatabaseUrl);
+
+  const { insertUser } = await import('./db/users.js');
+  const { hashPassword } = await import('./auth.js');
+  await insertUser({
+    id: `user_${randomUUID()}`,
+    username: testUsername,
+    passwordHash: await hashPassword(testPassword),
+    createdAt: new Date().toISOString()
+  });
 
   const s3 = new S3Client({
     region: 'us-east-1',
@@ -39,6 +55,7 @@ before(async () => {
       PORT: String(port),
       DATABASE_URL: testDatabaseUrl,
       OBJECT_STORE_BUCKET: testBucket,
+      JWT_SECRET: testJwtSecret,
       // Real Ollama embeddings are exercised end to end (OLLAMA_HOST stays live), but chat
       // generation is disabled so answers stay deterministic/extractive for assertions below -
       // OLLAMA_MODEL follows the same explicit-empty-disables convention as OLLAMA_HOST.
@@ -47,6 +64,14 @@ before(async () => {
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
+
+  await waitForServer();
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: testUsername, password: testPassword })
+  });
+  ({ token: authToken } = await login.json());
 });
 
 async function waitForServer() {
@@ -60,11 +85,54 @@ async function waitForServer() {
   throw new Error('Test server did not start');
 }
 
-async function request(path, options) {
-  const response = await fetch(`${baseUrl}${path}`, options);
+async function request(path, options = {}) {
+  const headers = { authorization: `Bearer ${authToken}`, ...(options.headers || {}) };
+  const response = await fetch(`${baseUrl}${path}`, { ...options, headers });
   const body = response.status === 204 ? null : await response.json();
   return { response, body };
 }
+
+test('a request with no Authorization header is rejected', async () => {
+  const { response } = await request('/api/documents', { headers: { authorization: '' } });
+  assert.equal(response.status, 401);
+});
+
+test('a request with an invalid token is rejected', async () => {
+  const { response } = await request('/api/documents', { headers: { authorization: 'Bearer not-a-real-token' } });
+  assert.equal(response.status, 401);
+});
+
+test('a request with an expired token is rejected', async () => {
+  const expiredToken = jwt.sign({ sub: 'user_1', username: testUsername }, testJwtSecret, { expiresIn: -10 });
+  const { response } = await request('/api/documents', { headers: { authorization: `Bearer ${expiredToken}` } });
+  assert.equal(response.status, 401);
+});
+
+test('login rejects the wrong password', async () => {
+  const response = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: testUsername, password: 'wrong-password' })
+  });
+  assert.equal(response.status, 401);
+});
+
+test('login with correct credentials returns a usable token', async () => {
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: testUsername, password: testPassword })
+  });
+  assert.equal(login.status, 200);
+  const { token } = await login.json();
+  const authed = await fetch(`${baseUrl}/api/documents`, { headers: { authorization: `Bearer ${token}` } });
+  assert.equal(authed.status, 200);
+});
+
+test('GET /api/health stays exempt from auth', async () => {
+  const response = await fetch(`${baseUrl}/api/health`);
+  assert.equal(response.status, 200);
+});
 
 test('document intelligence workflow completes end to end', async () => {
   await waitForServer();
@@ -104,7 +172,9 @@ test('document intelligence workflow completes end to end', async () => {
   });
   assert.equal(report.response.status, 201);
 
-  const downloadedReport = await fetch(`${baseUrl}${report.body.downloadUrl}`);
+  const downloadedReport = await fetch(`${baseUrl}${report.body.downloadUrl}`, {
+    headers: { authorization: `Bearer ${authToken}` }
+  });
   assert.equal(downloadedReport.status, 200);
   assert.match(await downloadedReport.text(), /Day 18 test report/);
 
@@ -288,6 +358,7 @@ test('an unreachable database degrades to a clean error instead of crashing the 
       PORT: String(brokenPort),
       DATABASE_URL: 'postgresql://amplify:amplify@localhost:1/nonexistent',
       OBJECT_STORE_ENDPOINT: 'http://localhost:1',
+      JWT_SECRET: testJwtSecret,
       OLLAMA_HOST: '',
       ANTHROPIC_API_KEY: ''
     },
@@ -310,7 +381,14 @@ test('an unreachable database degrades to a clean error instead of crashing the 
     assert.equal(healthBody.checks.database, false);
     assert.equal(healthBody.checks.objectStorage, false);
 
-    const listDocuments = await fetch(`${brokenBaseUrl}/api/documents`);
+    // requireAuth never queries the database (it only verifies the JWT signature/expiry), so a
+    // minted-but-unregistered token is enough here - this also doubles as a regression guard for
+    // that constraint, since a future change that added a DB lookup would make this hang/500
+    // instead of cleanly reaching the assertion below.
+    const brokenToken = jwt.sign({ sub: 'broken-test' }, testJwtSecret);
+    const listDocuments = await fetch(`${brokenBaseUrl}/api/documents`, {
+      headers: { authorization: `Bearer ${brokenToken}` }
+    });
     assert.equal(listDocuments.status, 500, 'a real DB-dependent route must degrade to a clean 500');
     const errorBody = await listDocuments.json();
     assert.equal(errorBody.error, 'Internal server error');
@@ -326,6 +404,7 @@ test('an unreachable database degrades to a clean error instead of crashing the 
 after(async () => {
   serverProcess.kill('SIGTERM');
   await once(serverProcess, 'exit');
+  await closePool();
 
   const s3 = new S3Client({
     region: 'us-east-1',

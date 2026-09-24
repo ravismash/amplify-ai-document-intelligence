@@ -1,12 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
 
 const API_BASE = 'http://localhost:4000';
-const API_KEY = import.meta.env.VITE_API_KEY || '';
+
+let authToken = localStorage.getItem('authToken');
+let notifyUnauthorized = () => {};
+
+function setAuthToken(token) {
+  authToken = token;
+  if (token) localStorage.setItem('authToken', token); else localStorage.removeItem('authToken');
+}
 
 function apiFetch(url, options = {}) {
-  return fetch(url, {
-    ...options,
-    headers: { ...(options.headers || {}), ...(API_KEY ? { 'x-api-key': API_KEY } : {}) }
+  const headers = { ...(options.headers || {}), ...(authToken ? { authorization: `Bearer ${authToken}` } : {}) };
+  return fetch(url, { ...options, headers }).then((response) => {
+    if (response.status === 401) notifyUnauthorized();
+    return response;
   });
 }
 
@@ -43,7 +51,47 @@ function displayStatus(status) {
   return status.charAt(0).toUpperCase() + status.slice(1);
 }
 
+function LoginForm({ onLogin }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    setSubmitting(true);
+    setError('');
+    try {
+      const response = await fetch(`${API_BASE}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Login failed');
+      onLogin(data.token);
+    } catch (submitError) {
+      setError(submitError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="login-screen">
+      <form className="panel login-form" onSubmit={handleSubmit}>
+        <h1>Amplify AI</h1>
+        <input autoFocus onChange={(event) => setUsername(event.target.value)} placeholder="Username" value={username} />
+        <input onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" value={password} />
+        {error && <p className="error-message">{error}</p>}
+        <button className="primary-button" disabled={submitting} type="submit">{submitting ? 'Signing in...' : 'Sign in'}</button>
+      </form>
+    </div>
+  );
+}
+
 export default function App() {
+  const [token, setToken] = useState(() => authToken);
   const [health, setHealth] = useState(null);
   const [activeView, setActiveView] = useState('Overview');
   const [question, setQuestion] = useState('');
@@ -74,7 +122,24 @@ export default function App() {
     document.getElementById(targetId)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
+  function handleLogin(newToken) {
+    setAuthToken(newToken);
+    setToken(newToken);
+  }
+
+  function handleLogout() {
+    setAuthToken(null);
+    setToken(null);
+  }
+
   useEffect(() => {
+    notifyUnauthorized = handleLogout;
+    return () => { notifyUnauthorized = () => {}; };
+  }, []);
+
+  useEffect(() => {
+    if (!token) return;
+
     apiFetch(`${API_BASE}/api/health`)
       .then((res) => res.json())
       .then((data) => setHealth(data))
@@ -86,7 +151,7 @@ export default function App() {
         if (data.documents?.length) setDocuments(data.documents.map((document) => ({ ...document, status: displayStatus(document.status) })));
       })
       .catch(() => {});
-  }, []);
+  }, [token]);
 
   async function handleExtract(documentId) {
     setExtractingId(documentId);
@@ -272,6 +337,8 @@ export default function App() {
     }
   }
 
+  if (!token) return <LoginForm onLogin={handleLogin} />;
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -299,6 +366,7 @@ export default function App() {
           <div className={`status ${health?.status === 'ok' ? 'online' : 'offline'}`}>
             {health?.status === 'ok' ? 'System online' : 'Backend offline'}
           </div>
+          <button className="primary-button" onClick={handleLogout} type="button">Log out</button>
         </header>
 
         <section className="overview-grid" id="overview-section">

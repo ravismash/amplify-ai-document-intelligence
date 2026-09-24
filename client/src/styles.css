@@ -124,6 +124,32 @@ h1 {
   box-shadow: var(--shadow);
 }
 
+.login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+}
+
+.login-form {
+  width: 320px;
+  display: grid;
+  gap: 14px;
+}
+
+.login-form h1 {
+  margin: 0 0 4px;
+  font-size: 1.2rem;
+}
+
+.login-form input {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text);
+}
+
 .metric-card {
   padding: 18px 20px;
 }

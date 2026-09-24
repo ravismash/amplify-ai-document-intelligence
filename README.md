@@ -28,10 +28,13 @@ Requires [Docker](https://www.docker.com/) for Postgres (with pgvector) and MinI
 npm install
 npm run docker:up      # starts Postgres + MinIO
 npm run migrate --workspace server
-cp server/.env.example server/.env   # fill in ANTHROPIC_API_KEY if not using local Ollama
+cp server/.env.example server/.env   # fill in JWT_SECRET (required - generate with `openssl rand -hex 32`) and ANTHROPIC_API_KEY if not using local Ollama
+npm run create-user --workspace server -- <username> <password>   # one-time, provisions your login
 npm run dev
 npm test --workspace server
 ```
+
+There is no signup UI - this app uses a single shared login, not per-user accounts, so access is provisioned via the `create-user` script above.
 
 Every push and pull request runs the same verification automatically through [CI](.github/workflows/ci.yml), including tests, the production build, syntax checks, and a high-severity dependency audit.
 
