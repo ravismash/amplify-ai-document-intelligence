@@ -18,6 +18,18 @@ function apiFetch(url, options = {}) {
   });
 }
 
+async function pollDocumentUntilSettled(documentId, isSettled, { intervalMs = 2000, timeoutMs = 120000 } = {}) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const response = await apiFetch(`${API_BASE}/api/documents/${documentId}`);
+    if (!response.ok) throw new Error('Failed to check document status');
+    const { document } = await response.json();
+    if (isSettled(document)) return document;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error('Timed out waiting for processing to finish');
+}
+
 const supportedFormats = [
   { format: 'PDF', limit: '25 MB' },
   { format: 'Microsoft Word', limit: '25 MB' },
@@ -156,7 +168,7 @@ export default function App() {
   async function handleExtract(documentId) {
     setExtractingId(documentId);
     setDocuments((currentDocuments) => currentDocuments.map((document) => (
-      document.id === documentId ? { ...document, status: 'Extracting' } : document
+      document.id === documentId ? { ...document, status: 'Queued' } : document
     )));
 
     try {
@@ -165,6 +177,11 @@ export default function App() {
       if (!response.ok) throw new Error(data.error || 'Text extraction failed');
       setDocuments((currentDocuments) => currentDocuments.map((document) => (
         document.id === documentId ? { ...document, ...data.document, status: displayStatus(data.document.status) } : document
+      )));
+      const finalDocument = await pollDocumentUntilSettled(documentId, (document) => ['extracted', 'failed'].includes(document.status));
+      if (finalDocument.status === 'failed') throw new Error(finalDocument.error || 'Text extraction failed');
+      setDocuments((currentDocuments) => currentDocuments.map((document) => (
+        document.id === documentId ? { ...document, ...finalDocument, status: displayStatus(finalDocument.status) } : document
       )));
     } catch (error) {
       setDocuments((currentDocuments) => currentDocuments.map((document) => (
@@ -178,7 +195,7 @@ export default function App() {
   async function handleOcr(documentId) {
     setExtractingId(documentId);
     setDocuments((currentDocuments) => currentDocuments.map((document) => (
-      document.id === documentId ? { ...document, status: 'Extracting' } : document
+      document.id === documentId ? { ...document, status: 'Queued' } : document
     )));
 
     try {
@@ -187,6 +204,11 @@ export default function App() {
       if (!response.ok) throw new Error(data.error || 'OCR failed');
       setDocuments((currentDocuments) => currentDocuments.map((document) => (
         document.id === documentId ? { ...document, ...data.document, status: displayStatus(data.document.status) } : document
+      )));
+      const finalDocument = await pollDocumentUntilSettled(documentId, (document) => ['extracted', 'failed'].includes(document.status));
+      if (finalDocument.status === 'failed') throw new Error(finalDocument.error || 'OCR failed');
+      setDocuments((currentDocuments) => currentDocuments.map((document) => (
+        document.id === documentId ? { ...document, ...finalDocument, status: displayStatus(finalDocument.status) } : document
       )));
     } catch (error) {
       setDocuments((currentDocuments) => currentDocuments.map((document) => (
@@ -209,6 +231,11 @@ export default function App() {
       if (!response.ok) throw new Error(data.error || 'Embedding generation failed');
       setDocuments((currentDocuments) => currentDocuments.map((document) => (
         document.id === documentId ? { ...document, ...data.document, status: displayStatus(data.document.status) } : document
+      )));
+      const finalDocument = await pollDocumentUntilSettled(documentId, (document) => ['indexed', 'failed'].includes(document.embeddingStatus));
+      if (finalDocument.embeddingStatus === 'failed') throw new Error(finalDocument.error || 'Embedding generation failed');
+      setDocuments((currentDocuments) => currentDocuments.map((document) => (
+        document.id === documentId ? { ...document, ...finalDocument, status: displayStatus(finalDocument.status) } : document
       )));
     } catch (error) {
       setDocuments((currentDocuments) => currentDocuments.map((document) => (

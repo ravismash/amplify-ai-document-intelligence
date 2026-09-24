@@ -19,8 +19,10 @@ const testBucket = `documents-test-${randomUUID()}`;
 const testJwtSecret = process.env.JWT_SECRET || 'test-jwt-secret-for-local-development-only';
 const testUsername = 'test-user';
 const testPassword = 'Test-Password-123!';
+const testQueuePrefix = `amplify_test_${randomUUID().replace(/-/g, '_')}`;
 
 let serverProcess;
+let workerProcess;
 let authToken;
 
 before(async () => {
@@ -48,20 +50,29 @@ before(async () => {
   });
   await s3.send(new CreateBucketCommand({ Bucket: testBucket }));
 
+  const sharedProcessEnv = {
+    ...process.env,
+    DATABASE_URL: testDatabaseUrl,
+    OBJECT_STORE_BUCKET: testBucket,
+    JWT_SECRET: testJwtSecret,
+    REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379',
+    QUEUE_PREFIX: testQueuePrefix,
+    // Real Ollama embeddings are exercised end to end (OLLAMA_HOST stays live), but chat
+    // generation is disabled so answers stay deterministic/extractive for assertions below -
+    // OLLAMA_MODEL follows the same explicit-empty-disables convention as OLLAMA_HOST.
+    OLLAMA_MODEL: '',
+    ANTHROPIC_API_KEY: ''
+  };
+
   serverProcess = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
-    env: {
-      ...process.env,
-      PORT: String(port),
-      DATABASE_URL: testDatabaseUrl,
-      OBJECT_STORE_BUCKET: testBucket,
-      JWT_SECRET: testJwtSecret,
-      // Real Ollama embeddings are exercised end to end (OLLAMA_HOST stays live), but chat
-      // generation is disabled so answers stay deterministic/extractive for assertions below -
-      // OLLAMA_MODEL follows the same explicit-empty-disables convention as OLLAMA_HOST.
-      OLLAMA_MODEL: '',
-      ANTHROPIC_API_KEY: ''
-    },
+    env: { ...sharedProcessEnv, PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  workerProcess = spawn(process.execPath, ['worker.js'], {
+    cwd: process.cwd(),
+    env: sharedProcessEnv,
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
@@ -90,6 +101,30 @@ async function request(path, options = {}) {
   const response = await fetch(`${baseUrl}${path}`, { ...options, headers });
   const body = response.status === 204 ? null : await response.json();
   return { response, body };
+}
+
+async function pollUntil(fn, predicate, { timeoutMs = 30000, intervalMs = 500 } = {}) {
+  const startedAt = Date.now();
+  let last;
+  while (Date.now() - startedAt < timeoutMs) {
+    last = await fn();
+    if (predicate(last)) return last;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`pollUntil timed out; last value: ${JSON.stringify(last)}`);
+}
+
+async function extractAndIndex(documentId) {
+  await request(`/api/documents/${documentId}/extract`, { method: 'POST' });
+  await pollUntil(
+    () => request(`/api/documents/${documentId}`),
+    (result) => ['extracted', 'failed'].includes(result.body.document.status)
+  );
+  await request(`/api/documents/${documentId}/index`, { method: 'POST' });
+  await pollUntil(
+    () => request(`/api/documents/${documentId}`),
+    (result) => ['indexed', 'failed'].includes(result.body.document.embeddingStatus)
+  );
 }
 
 test('a request with no Authorization header is rejected', async () => {
@@ -144,13 +179,22 @@ test('document intelligence workflow completes end to end', async () => {
   const documentId = upload.body.document.id;
 
   const extraction = await request(`/api/documents/${documentId}/extract`, { method: 'POST' });
-  assert.equal(extraction.response.status, 200);
-  assert.equal(extraction.body.document.status, 'extracted');
+  assert.equal(extraction.response.status, 202);
+  const extracted = await pollUntil(
+    () => request(`/api/documents/${documentId}`),
+    (result) => ['extracted', 'failed'].includes(result.body.document.status)
+  );
+  assert.equal(extracted.body.document.status, 'extracted');
 
   const indexing = await request(`/api/documents/${documentId}/index`, { method: 'POST' });
-  assert.equal(indexing.response.status, 200);
-  assert.equal(indexing.body.document.embeddingStatus, 'indexed');
-  assert.ok(indexing.body.chunks[0].embedding.length > 0);
+  assert.equal(indexing.response.status, 202);
+  const indexed = await pollUntil(
+    () => request(`/api/documents/${documentId}`),
+    (result) => ['indexed', 'failed'].includes(result.body.document.embeddingStatus)
+  );
+  assert.equal(indexed.body.document.embeddingStatus, 'indexed');
+  const indexedChunks = await request(`/api/documents/${documentId}/chunks`);
+  assert.ok(indexedChunks.body.chunks[0].embedding.length > 0);
 
   const question = await request('/api/questions', {
     method: 'POST',
@@ -239,11 +283,15 @@ test('concurrent extraction does not lose document updates', async () => {
   );
   const documentIds = uploads.map((upload) => upload.body.document.id);
 
-  await Promise.all(documentIds.map((id) => request(`/api/documents/${id}/extract`, { method: 'POST' })));
+  const extractions = await Promise.all(documentIds.map((id) => request(`/api/documents/${id}/extract`, { method: 'POST' })));
+  for (const extraction of extractions) assert.equal(extraction.response.status, 202);
 
-  const refetched = await Promise.all(documentIds.map((id) => request(`/api/documents/${id}`)));
-  const stillExtracting = refetched.filter((item) => item.body.document.status !== 'extracted');
-  assert.equal(stillExtracting.length, 0, 'every concurrently-extracted document must persist as extracted, not be clobbered by a sibling request');
+  const settled = await Promise.all(documentIds.map((id) => pollUntil(
+    () => request(`/api/documents/${id}`),
+    (result) => ['extracted', 'failed'].includes(result.body.document.status)
+  )));
+  const notExtracted = settled.filter((result) => result.body.document.status !== 'extracted');
+  assert.equal(notExtracted.length, 0, 'every concurrently-extracted document must persist as extracted, not be clobbered by a sibling request');
 
   await Promise.all(documentIds.map((id) => request(`/api/documents/${id}`, { method: 'DELETE' })));
 });
@@ -257,8 +305,7 @@ test('retrieval favors the topically relevant chunk over a lexically noisy one',
   form.append('file', new Blob([`${longIrrelevantChunk}\n\n${shortRelevantChunk}`], { type: 'text/plain' }), 'scoring-regression.txt');
   const upload = await request('/api/documents', { method: 'POST', body: form });
   const documentId = upload.body.document.id;
-  await request(`/api/documents/${documentId}/extract`, { method: 'POST' });
-  await request(`/api/documents/${documentId}/index`, { method: 'POST' });
+  await extractAndIndex(documentId);
 
   const question = await request('/api/questions', {
     method: 'POST',
@@ -286,8 +333,7 @@ test('duplicate chunk content is not repeated in a single answer', async () => {
   const idA = uploadOne.body.document.id;
   const idB = uploadTwo.body.document.id;
   for (const id of [idA, idB]) {
-    await request(`/api/documents/${id}/extract`, { method: 'POST' });
-    await request(`/api/documents/${id}/index`, { method: 'POST' });
+    await extractAndIndex(id);
   }
 
   const question = await request('/api/questions', {
@@ -404,7 +450,17 @@ test('an unreachable database degrades to a clean error instead of crashing the 
 after(async () => {
   serverProcess.kill('SIGTERM');
   await once(serverProcess, 'exit');
+  workerProcess.kill('SIGTERM');
+  await once(workerProcess, 'exit');
   await closePool();
+
+  // CI's Redis is ephemeral per-run, but a local dev Redis is long-lived - without this, repeated
+  // local `npm test` runs would leave orphaned BullMQ keys under a fresh testQueuePrefix forever.
+  const Redis = (await import('ioredis')).default;
+  const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+  const keys = await redis.keys(`${testQueuePrefix}:*`);
+  if (keys.length) await redis.del(...keys);
+  await redis.quit();
 
   const s3 = new S3Client({
     region: 'us-east-1',

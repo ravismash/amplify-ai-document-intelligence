@@ -25,6 +25,15 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -73,9 +82,10 @@ jobs:
           OLLAMA_HOST: http://localhost:11434
           OLLAMA_EMBEDDING_MODEL: nomic-embed-text
           JWT_SECRET: test-only-secret-for-ci
+          REDIS_URL: redis://localhost:6379
 
       - name: Validate JavaScript syntax
-        run: node --check server/server.js && node --check server/server.test.js && node --check server/auth.js
+        run: node --check server/server.js && node --check server/server.test.js && node --check server/auth.js && node --check server/worker.js && node --check server/queue.js && node --check server/processing.js
 
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high

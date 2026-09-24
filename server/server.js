@@ -2,8 +2,6 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import multer from 'multer';
-import pdfParse from 'pdf-parse/lib/pdf-parse.js';
-import { createWorker } from 'tesseract.js';
 import Anthropic from '@anthropic-ai/sdk';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -17,6 +15,8 @@ import * as reportsDb from './db/reports.js';
 import { getPool, closePool } from './db/pool.js';
 import * as usersDb from './db/users.js';
 import { verifyToken, verifyPassword, signToken } from './auth.js';
+import { OLLAMA_HOST, OLLAMA_EMBEDDING_MODEL, normalizeText, withRetry, embedTexts } from './processing.js';
+import { extractQueue, ocrQueue, indexQueue } from './queue.js';
 
 dotenv.config();
 
@@ -29,9 +29,7 @@ if (!process.env.JWT_SECRET?.trim()) {
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY?.trim() || '';
 const ANSWER_MODEL = 'claude-sonnet-5';
 const anthropicClient = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
-const OLLAMA_HOST = process.env.OLLAMA_HOST !== undefined ? process.env.OLLAMA_HOST.trim() : 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL !== undefined ? process.env.OLLAMA_MODEL.trim() : 'llama3.1';
-const OLLAMA_EMBEDDING_MODEL = process.env.OLLAMA_EMBEDDING_MODEL?.trim() || 'nomic-embed-text';
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map((origin) => origin.trim());
 const fileLimitsMb = {
   'application/pdf': 25,
@@ -45,27 +43,6 @@ const fileLimitsMb = {
 
 function logEvent(event, fields = {}) {
   console.log(JSON.stringify({ timestamp: new Date().toISOString(), event, ...fields }));
-}
-
-async function withRetry(operation, attempts = 2) {
-  let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      return await operation();
-    } catch (error) {
-      lastError = error;
-      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
-    }
-  }
-  throw lastError;
-}
-
-function normalizeText(text) {
-  return text
-    .replace(/\r\n?/g, '\n')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
 }
 
 const stopWords = new Set(['about', 'and', 'are', 'can', 'does', 'for', 'from', 'how', 'into', 'is', 'the', 'this', 'what', 'where', 'which', 'with']);
@@ -104,67 +81,6 @@ function expandedSearchTerms(text) {
   return terms;
 }
 
-function createChunks(documentId, pages) {
-  const chunkSize = 900;
-  const overlap = 120;
-  const chunks = [];
-
-  for (const page of pages) {
-    const text = normalizeText(page.text);
-    if (!text) continue;
-    let start = 0;
-    let chunkIndex = 0;
-    while (start < text.length) {
-      const end = Math.min(start + chunkSize, text.length);
-      const chunkText = text.slice(start, end).trim();
-      chunks.push({
-        id: `chunk_${randomUUID()}`,
-        documentId,
-        text: chunkText,
-        pageNumber: page.pageNumber,
-        section: null,
-        chunkIndex,
-        characterStart: start,
-        characterEnd: end,
-        embeddingStatus: 'pending'
-      });
-      if (end === text.length) break;
-      start = Math.max(end - overlap, start + 1);
-      chunkIndex += 1;
-    }
-  }
-  return chunks;
-}
-
-async function persistChunks(documentId, pages) {
-  const documentChunks = createChunks(documentId, pages);
-  await chunksDb.replaceChunksForDocument(documentId, documentChunks);
-  return documentChunks;
-}
-
-async function callOllamaEmbeddingBatch(texts) {
-  const response = await fetch(`${OLLAMA_HOST}/api/embed`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: OLLAMA_EMBEDDING_MODEL, input: texts })
-  });
-  if (!response.ok) throw new Error(`Ollama embedding request failed: ${response.status}`);
-  const data = await response.json();
-  return data.embeddings;
-}
-
-// nomic-embed-text is trained on prefixed inputs and produces poorly separated similarity scores
-// without them - documents and queries use different prefixes because the model is asymmetric
-// (a query and its matching passage aren't expected to look alike, unlike a passage vs itself).
-async function embedTexts(texts, taskPrefix, batchSize = 16) {
-  const vectors = [];
-  for (let i = 0; i < texts.length; i += batchSize) {
-    const batch = texts.slice(i, i + batchSize).map((text) => `${taskPrefix}${text}`);
-    vectors.push(...(await withRetry(() => callOllamaEmbeddingBatch(batch))));
-  }
-  return vectors;
-}
-
 function cosineSimilarity(left, right) {
   let dot = 0;
   let leftMagnitude = 0;
@@ -176,23 +92,6 @@ function cosineSimilarity(left, right) {
   }
   const denominator = Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude);
   return denominator === 0 ? 0 : dot / denominator;
-}
-
-async function indexDocumentChunks(documentId) {
-  const documentChunks = await chunksDb.getChunksByDocumentId(documentId);
-  if (!documentChunks.length) return [];
-  const embeddings = await embedTexts(documentChunks.map((chunk) => chunk.text), 'search_document: ');
-  const indexedAt = new Date().toISOString();
-  const indexedChunks = documentChunks.map((chunk, index) => ({
-    ...chunk,
-    embedding: embeddings[index],
-    embeddingModel: OLLAMA_EMBEDDING_MODEL,
-    embeddingDimensions: embeddings[index].length,
-    embeddingStatus: 'indexed',
-    indexedAt
-  }));
-  await chunksDb.setChunkEmbeddings(indexedChunks);
-  return indexedChunks;
 }
 
 async function removeDocumentData(documentId) {
@@ -329,46 +228,6 @@ async function generateGroundedAnswer(query, results) {
     }
   }
   throw lastError;
-}
-
-async function extractDocument(storageKey, mimeType) {
-  const buffer = await objectStore.getObjectBuffer(storageKey);
-  if (mimeType === 'application/pdf') {
-    const parsedPdf = await pdfParse(buffer, {
-      pagerender: async (pageData) => {
-        const textContent = await pageData.getTextContent();
-        return textContent.items.map((item) => item.str).join(' ');
-      }
-    });
-    const pages = parsedPdf.text.split('\f').map((text, index) => ({
-      pageNumber: index + 1,
-      text: text.trim(),
-      confidence: null
-    })).filter((page) => page.text);
-    return { text: parsedPdf.text.trim(), pages: pages.length ? pages : [{ pageNumber: 1, text: parsedPdf.text.trim(), confidence: null }] };
-  }
-
-  const text = buffer.toString('utf8').trim();
-  return { text, pages: [{ pageNumber: 1, text, confidence: null }] };
-}
-
-async function ocrDocument(storageKey) {
-  const worker = await createWorker('eng');
-  try {
-    const buffer = await objectStore.getObjectBuffer(storageKey);
-    const result = await worker.recognize(buffer);
-    const text = result.data.text.trim();
-    return {
-      text,
-      pages: [{
-        pageNumber: 1,
-        text,
-        confidence: Math.round(result.data.confidence)
-      }]
-    };
-  } finally {
-    await worker.terminate();
-  }
 }
 
 const upload = multer({
@@ -671,34 +530,16 @@ app.get('/api/reports/:id/download', async (req, res) => {
 
 app.post('/api/index/rebuild', async (req, res) => {
   const documents = await documentsDb.getAllDocuments();
-  const indexed = [];
-  const failures = [];
+  let enqueued = 0;
   for (const document of documents) {
-    try {
-      const existingChunks = await chunksDb.getChunksByDocumentId(document.id);
-      if (!existingChunks.length) continue;
-      indexed.push(...(await indexDocumentChunks(document.id)));
-      await documentsDb.updateDocument(document.id, {
-        status: 'ready',
-        embeddingStatus: 'indexed',
-        updatedAt: new Date().toISOString(),
-        error: null
-      });
-    } catch (error) {
-      failures.push({ documentId: document.id, error: error.message });
-      await documentsDb.updateDocument(document.id, {
-        embeddingStatus: 'failed',
-        error: error.message,
-        updatedAt: new Date().toISOString()
-      });
-    }
+    if (['queued', 'processing'].includes(document.embeddingStatus)) continue;
+    const existingChunks = await chunksDb.getChunksByDocumentId(document.id);
+    if (!existingChunks.length) continue;
+    await documentsDb.updateDocument(document.id, { embeddingStatus: 'queued', updatedAt: new Date().toISOString(), error: null });
+    await indexQueue.add('index', { documentId: document.id }, { jobId: document.id });
+    enqueued += 1;
   }
-  res.json({
-    indexedChunks: indexed.length,
-    documentCount: documents.length,
-    failedDocuments: failures,
-    model: OLLAMA_EMBEDDING_MODEL
-  });
+  res.status(202).json({ enqueued, documentCount: documents.length, model: OLLAMA_EMBEDDING_MODEL });
 });
 
 app.delete('/api/documents/:id', async (req, res) => {
@@ -711,34 +552,27 @@ app.delete('/api/documents/:id', async (req, res) => {
 });
 
 app.post('/api/documents/:id/index', async (req, res) => {
-  let document = await documentsDb.getDocumentById(req.params.id);
+  const document = await documentsDb.getDocumentById(req.params.id);
   if (!document) {
     res.status(404).json({ error: 'Document not found' });
     return;
   }
-
-  try {
-    const chunks = await indexDocumentChunks(document.id);
-    if (!chunks.length) {
-      res.status(422).json({ error: 'Extract document text before creating embeddings' });
-      return;
-    }
-    document = await documentsDb.updateDocument(document.id, {
-      status: 'ready',
-      embeddingStatus: 'indexed',
-      chunkCount: chunks.length,
-      updatedAt: new Date().toISOString(),
-      error: null
-    });
-    res.json({ document, chunks, model: OLLAMA_EMBEDDING_MODEL });
-  } catch (error) {
-    document = await documentsDb.updateDocument(document.id, {
-      embeddingStatus: 'failed',
-      error: error.message,
-      updatedAt: new Date().toISOString()
-    });
-    res.status(422).json({ error: `Embedding generation failed: ${error.message}`, document });
+  if (['queued', 'processing'].includes(document.embeddingStatus)) {
+    res.status(409).json({ error: 'Document is already queued or being indexed' });
+    return;
   }
+  const existingChunks = await chunksDb.getChunksByDocumentId(document.id);
+  if (!existingChunks.length) {
+    res.status(422).json({ error: 'Extract document text before creating embeddings' });
+    return;
+  }
+  const updated = await documentsDb.updateDocument(document.id, {
+    embeddingStatus: 'queued',
+    updatedAt: new Date().toISOString(),
+    error: null
+  });
+  await indexQueue.add('index', { documentId: document.id }, { jobId: document.id });
+  res.status(202).json({ document: updated });
 });
 
 const extensionByMimeType = {
@@ -784,43 +618,22 @@ app.post('/api/documents', upload.single('file'), async (req, res) => {
 });
 
 app.post('/api/documents/:id/extract', async (req, res) => {
-  let document = await documentsDb.updateDocument(req.params.id, {
-    status: 'extracting',
-    updatedAt: new Date().toISOString(),
-    error: null
-  });
-  if (!document) {
+  const existing = await documentsDb.getDocumentById(req.params.id);
+  if (!existing) {
     res.status(404).json({ error: 'Document not found' });
     return;
   }
-
-  try {
-    const result = await withRetry(() => extractDocument(document.storageName, document.mimeType));
-    const extraction = await extractionsDb.upsertExtraction({
-      documentId: document.id,
-      status: 'completed',
-      text: result.text,
-      pages: result.pages,
-      error: null,
-      extractedAt: new Date().toISOString()
-    });
-    const chunks = await persistChunks(document.id, result.pages);
-
-    document = await documentsDb.updateDocument(document.id, {
-      status: 'extracted',
-      pageCount: result.pages.length,
-      chunkCount: chunks.length,
-      updatedAt: new Date().toISOString()
-    });
-    res.json({ document, extraction, chunks });
-  } catch (error) {
-    document = await documentsDb.updateDocument(document.id, {
-      status: 'failed',
-      error: error.message,
-      updatedAt: new Date().toISOString()
-    });
-    res.status(422).json({ error: `Text extraction failed: ${error.message}`, document });
+  if (['queued', 'extracting'].includes(existing.status)) {
+    res.status(409).json({ error: 'Document is already queued or extracting' });
+    return;
   }
+  const document = await documentsDb.updateDocument(existing.id, {
+    status: 'queued',
+    updatedAt: new Date().toISOString(),
+    error: null
+  });
+  await extractQueue.add('extract', { documentId: document.id }, { jobId: document.id });
+  res.status(202).json({ document });
 });
 
 app.post('/api/documents/:id/ocr', async (req, res) => {
@@ -833,41 +646,17 @@ app.post('/api/documents/:id/ocr', async (req, res) => {
     res.status(422).json({ error: 'OCR currently supports PNG and JPEG scans' });
     return;
   }
-
-  let document = await documentsDb.updateDocument(req.params.id, {
-    status: 'extracting',
+  if (['queued', 'extracting'].includes(existing.status)) {
+    res.status(409).json({ error: 'Document is already queued or extracting' });
+    return;
+  }
+  const document = await documentsDb.updateDocument(existing.id, {
+    status: 'queued',
     updatedAt: new Date().toISOString(),
     error: null
   });
-
-  try {
-    const result = await withRetry(() => ocrDocument(document.storageName));
-    const extraction = await extractionsDb.upsertExtraction({
-      documentId: document.id,
-      status: 'completed',
-      method: 'ocr',
-      text: result.text,
-      pages: result.pages,
-      error: null,
-      extractedAt: new Date().toISOString()
-    });
-    const chunks = await persistChunks(document.id, result.pages);
-
-    document = await documentsDb.updateDocument(document.id, {
-      status: 'extracted',
-      pageCount: 1,
-      chunkCount: chunks.length,
-      updatedAt: new Date().toISOString()
-    });
-    res.json({ document, extraction, chunks });
-  } catch (error) {
-    document = await documentsDb.updateDocument(document.id, {
-      status: 'failed',
-      error: error.message,
-      updatedAt: new Date().toISOString()
-    });
-    res.status(422).json({ error: `OCR failed: ${error.message}`, document });
-  }
+  await ocrQueue.add('ocr', { documentId: document.id }, { jobId: document.id });
+  res.status(202).json({ document });
 });
 
 app.use((error, req, res, next) => {
