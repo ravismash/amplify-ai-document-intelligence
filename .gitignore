@@ -5,3 +5,4 @@ dist/
 !.env.example
 server/storage/*
 !server/storage/.gitkeep
+.claude/

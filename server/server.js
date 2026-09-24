@@ -17,7 +17,7 @@ import { getPool, closePool } from './db/pool.js';
 import * as usersDb from './db/users.js';
 import { verifyToken, verifyPassword, signToken } from './auth.js';
 import { OLLAMA_HOST, OLLAMA_EMBEDDING_MODEL, normalizeText, withRetry, embedTexts } from './processing.js';
-import { extractQueue, ocrQueue, indexQueue, checkRedisHealth } from './queue.js';
+import { extractQueue, ocrQueue, indexQueue, checkRedisHealth, enqueueUnique } from './queue.js';
 import { logEvent } from './logger.js';
 import { register, httpRequestDuration, refreshQueueMetrics } from './metrics.js';
 import { loginLimiter, llmRouteLimiter, uploadLimiter, rebuildLimiter } from './rateLimit.js';
@@ -587,7 +587,7 @@ app.post('/api/index/rebuild', rebuildLimiter, async (req, res) => {
     const existingChunks = await chunksDb.getChunksByDocumentId(document.id);
     if (!existingChunks.length) continue;
     await documentsDb.updateDocument(document.id, { embeddingStatus: 'queued', updatedAt: new Date().toISOString(), error: null });
-    await indexQueue.add('index', { documentId: document.id }, { jobId: document.id });
+    await enqueueUnique(indexQueue, 'index', document.id);
     enqueued += 1;
   }
   res.status(202).json({ enqueued, skipped, documentCount: documents.length, model: OLLAMA_EMBEDDING_MODEL });
@@ -622,7 +622,7 @@ app.post('/api/documents/:id/index', async (req, res) => {
     updatedAt: new Date().toISOString(),
     error: null
   });
-  await indexQueue.add('index', { documentId: document.id }, { jobId: document.id });
+  await enqueueUnique(indexQueue, 'index', document.id);
   res.status(202).json({ document: updated });
 });
 
@@ -683,7 +683,7 @@ app.post('/api/documents/:id/extract', async (req, res) => {
     updatedAt: new Date().toISOString(),
     error: null
   });
-  await extractQueue.add('extract', { documentId: document.id }, { jobId: document.id });
+  await enqueueUnique(extractQueue, 'extract', document.id);
   res.status(202).json({ document });
 });
 
@@ -706,7 +706,7 @@ app.post('/api/documents/:id/ocr', async (req, res) => {
     updatedAt: new Date().toISOString(),
     error: null
   });
-  await ocrQueue.add('ocr', { documentId: document.id }, { jobId: document.id });
+  await enqueueUnique(ocrQueue, 'ocr', document.id);
   res.status(202).json({ document });
 });
 

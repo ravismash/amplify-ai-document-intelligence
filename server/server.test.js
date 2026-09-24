@@ -383,6 +383,36 @@ test('concurrent extraction does not lose document updates', async () => {
   await Promise.all(documentIds.map((id) => request(`/api/documents/${id}`, { method: 'DELETE' })));
 });
 
+test('re-indexing an already-indexed document runs a new job instead of sticking at queued', async () => {
+  await waitForServer();
+
+  const form = new FormData();
+  form.append('file', new Blob(['Re-index regression document about warehouse capacity.'], { type: 'text/plain' }), 'reindex.txt');
+  const upload = await request('/api/documents', { method: 'POST', body: form });
+  const documentId = upload.body.document.id;
+  await extractAndIndex(documentId);
+
+  // The first index job is now completed but still retained in Redis under jobId === documentId.
+  // A plain queue.add() with that jobId would return the stale job and nothing would ever run.
+  const reindexing = await request(`/api/documents/${documentId}/index`, { method: 'POST' });
+  assert.equal(reindexing.response.status, 202);
+  const reindexed = await pollUntil(
+    () => request(`/api/documents/${documentId}`),
+    (result) => ['indexed', 'failed'].includes(result.body.document.embeddingStatus)
+  );
+  assert.equal(reindexed.body.document.embeddingStatus, 'indexed');
+
+  const rebuild = await request('/api/index/rebuild', { method: 'POST' });
+  assert.equal(rebuild.response.status, 202);
+  const rebuilt = await pollUntil(
+    () => request(`/api/documents/${documentId}`),
+    (result) => ['indexed', 'failed'].includes(result.body.document.embeddingStatus)
+  );
+  assert.equal(rebuilt.body.document.embeddingStatus, 'indexed');
+
+  await request(`/api/documents/${documentId}`, { method: 'DELETE' });
+});
+
 test('retrieval favors the topically relevant chunk over a lexically noisy one', async () => {
   await waitForServer();
 
