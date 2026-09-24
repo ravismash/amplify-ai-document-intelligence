@@ -11,6 +11,7 @@
     "dev": "npm run dev:server & npm run dev:client",
     "verify": "npm test --workspace server && npm run build --workspace client",
     "docker:up": "docker compose up -d",
-    "docker:down": "docker compose down"
+    "docker:down": "docker compose down",
+    "observability:up": "docker compose --profile observability up -d"
   }
 }

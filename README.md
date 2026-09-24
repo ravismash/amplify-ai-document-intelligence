@@ -43,6 +43,20 @@ Then open:
 - Frontend: http://localhost:5173
 - Backend: http://localhost:4000/api/health
 
+## Observability
+
+The server exposes Prometheus-format metrics at `/metrics` (HTTP request rate/latency, job queue depth, default Node.js process metrics) and a `GET /api/health` endpoint whose `status` field genuinely reflects the health of Postgres, object storage, and Redis (not a hardcoded `ok`).
+
+`/metrics` is intentionally unauthenticated, matching standard Prometheus exporter convention - it must not be exposed on the public internet in a real deployment; restrict it at the firewall/reverse-proxy level to only the box running Prometheus.
+
+A self-hosted Prometheus + Grafana stack is available behind a Docker Compose profile, off by default so everyday `npm run docker:up` stays fast:
+
+```bash
+npm run observability:up
+```
+
+Then open Grafana at http://localhost:3000 (default login `admin`/`admin`, or set `GRAFANA_ADMIN_PASSWORD`) - the Prometheus datasource and the "Amplify AI Overview" dashboard are both auto-provisioned from files in `observability/`, no manual setup required.
+
 ## 20-Day Delivery Plan
 
 ### Day 1 - Project foundation (complete)

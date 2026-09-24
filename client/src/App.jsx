@@ -63,6 +63,15 @@ function displayStatus(status) {
   return status.charAt(0).toUpperCase() + status.slice(1);
 }
 
+const checkLabels = { database: 'Database', objectStorage: 'Object storage', redis: 'Job queue' };
+
+function describeHealth(health) {
+  if (health?.status === 'ok') return 'System online';
+  if (!health?.checks) return 'Backend offline';
+  const failing = Object.entries(health.checks).filter(([, ok]) => !ok).map(([check]) => checkLabels[check] || check);
+  return failing.length ? `Degraded: ${failing.join(', ')} unreachable` : 'Backend offline';
+}
+
 function LoginForm({ onLogin }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -152,10 +161,20 @@ export default function App() {
   useEffect(() => {
     if (!token) return;
 
-    apiFetch(`${API_BASE}/api/health`)
-      .then((res) => res.json())
-      .then((data) => setHealth(data))
-      .catch(() => setHealth({ status: 'offline' }));
+    function refreshHealth() {
+      apiFetch(`${API_BASE}/api/health`)
+        .then((res) => res.json())
+        .then((data) => setHealth(data))
+        .catch(() => setHealth({ status: 'offline' }));
+    }
+
+    refreshHealth();
+    const interval = setInterval(refreshHealth, 30000);
+    return () => clearInterval(interval);
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) return;
 
     apiFetch(`${API_BASE}/api/documents`)
       .then((res) => res.json())
@@ -391,7 +410,7 @@ export default function App() {
             <h1>Document Intelligence Workspace</h1>
           </div>
           <div className={`status ${health?.status === 'ok' ? 'online' : 'offline'}`}>
-            {health?.status === 'ok' ? 'System online' : 'Backend offline'}
+            {describeHealth(health)}
           </div>
           <button className="primary-button" onClick={handleLogout} type="button">Log out</button>
         </header>

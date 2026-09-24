@@ -16,7 +16,9 @@ import { getPool, closePool } from './db/pool.js';
 import * as usersDb from './db/users.js';
 import { verifyToken, verifyPassword, signToken } from './auth.js';
 import { OLLAMA_HOST, OLLAMA_EMBEDDING_MODEL, normalizeText, withRetry, embedTexts } from './processing.js';
-import { extractQueue, ocrQueue, indexQueue } from './queue.js';
+import { extractQueue, ocrQueue, indexQueue, checkRedisHealth } from './queue.js';
+import { logEvent } from './logger.js';
+import { register, httpRequestDuration, refreshQueueMetrics } from './metrics.js';
 
 dotenv.config();
 
@@ -40,10 +42,6 @@ const fileLimitsMb = {
   'text/plain': 10,
   'text/csv': 10
 };
-
-function logEvent(event, fields = {}) {
-  console.log(JSON.stringify({ timestamp: new Date().toISOString(), event, ...fields }));
-}
 
 const stopWords = new Set(['about', 'and', 'are', 'can', 'does', 'for', 'from', 'how', 'into', 'is', 'the', 'this', 'what', 'where', 'which', 'with']);
 
@@ -252,13 +250,12 @@ app.use((req, res, next) => {
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('x-frame-options', 'DENY');
   res.setHeader('referrer-policy', 'no-referrer');
-  res.on('finish', () => logEvent('http_request', {
-    requestId,
-    method: req.method,
-    path: req.path,
-    status: res.statusCode,
-    durationMs: Date.now() - startedAt
-  }));
+  res.on('finish', () => {
+    const durationMs = Date.now() - startedAt;
+    const route = req.route?.path || 'unmatched';
+    httpRequestDuration.observe({ method: req.method, route, status: res.statusCode }, durationMs / 1000);
+    logEvent('http_request', { requestId, method: req.method, path: req.path, status: res.statusCode, durationMs });
+  });
   next();
 });
 
@@ -322,11 +319,23 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.get('/api/health', async (req, res) => {
-  const [databaseHealthy, objectStoreHealthy] = await Promise.all([
+  const [databaseHealthy, objectStoreHealthy, redisHealthy] = await Promise.all([
     getPool().query('SELECT 1').then(() => true).catch(() => false),
-    objectStore.isHealthy()
+    objectStore.isHealthy(),
+    checkRedisHealth()
   ]);
-  res.json({ status: 'ok', service: 'amplify-ai-server', checks: { database: databaseHealthy, objectStorage: objectStoreHealthy } });
+  const healthy = databaseHealthy && objectStoreHealthy && redisHealthy;
+  res.json({
+    status: healthy ? 'ok' : 'degraded',
+    service: 'amplify-ai-server',
+    checks: { database: databaseHealthy, objectStorage: objectStoreHealthy, redis: redisHealthy }
+  });
+});
+
+app.get('/metrics', async (req, res) => {
+  await refreshQueueMetrics();
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
 });
 
 app.get('/api/summary', (req, res) => {
@@ -682,6 +691,10 @@ app.use((error, req, res, next) => {
     }
     // Anything else - a Postgres or MinIO failure forwarded by asyncRoute, most likely - is an
     // infrastructure problem, not something wrong with the request. Don't call it a parsing issue.
+    // Log the stack trace here specifically - this is the one branch where root-causing a failure
+    // otherwise requires reproducing it locally, since the response itself deliberately never
+    // exposes internals to the client.
+    logEvent('unhandled_error', { requestId: res.getHeader('x-request-id'), message: error.message, stack: error.stack });
     res.status(500).json({ error: 'Internal server error' });
     return;
   }

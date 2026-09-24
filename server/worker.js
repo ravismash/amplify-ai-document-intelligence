@@ -7,10 +7,7 @@ import { withRetry, extractDocument, ocrDocument, indexDocumentChunks, persistCh
 import * as documentsDb from './db/documents.js';
 import * as extractionsDb from './db/extractions.js';
 import { closePool } from './db/pool.js';
-
-function logEvent(event, fields = {}) {
-  console.log(JSON.stringify({ timestamp: new Date().toISOString(), event, ...fields }));
-}
+import { logEvent } from './logger.js';
 
 async function handleExtractLike({ documentId, method }) {
   const document = await documentsDb.getDocumentById(documentId);

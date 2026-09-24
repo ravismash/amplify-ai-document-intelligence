@@ -167,6 +167,18 @@ test('login with correct credentials returns a usable token', async () => {
 test('GET /api/health stays exempt from auth', async () => {
   const response = await fetch(`${baseUrl}/api/health`);
   assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.status, 'ok');
+  assert.deepEqual(body.checks, { database: true, objectStorage: true, redis: true });
+});
+
+test('GET /metrics returns Prometheus-format output', async () => {
+  const response = await fetch(`${baseUrl}/metrics`);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /^text\/plain/);
+  const body = await response.text();
+  assert.match(body, /http_request_duration_seconds/);
+  assert.match(body, /job_queue_depth/);
 });
 
 test('document intelligence workflow completes end to end', async () => {
@@ -404,6 +416,7 @@ test('an unreachable database degrades to a clean error instead of crashing the 
       PORT: String(brokenPort),
       DATABASE_URL: 'postgresql://amplify:amplify@localhost:1/nonexistent',
       OBJECT_STORE_ENDPOINT: 'http://localhost:1',
+      REDIS_URL: 'redis://localhost:1',
       JWT_SECRET: testJwtSecret,
       OLLAMA_HOST: '',
       ANTHROPIC_API_KEY: ''
@@ -424,8 +437,10 @@ test('an unreachable database degrades to a clean error instead of crashing the 
     const health = await fetch(`${brokenBaseUrl}/api/health`);
     assert.equal(health.status, 200, 'the process must start and answer health checks even with unreachable infra');
     const healthBody = await health.json();
+    assert.equal(healthBody.status, 'degraded', 'the top-level status must reflect a real dependency outage, not always say ok');
     assert.equal(healthBody.checks.database, false);
     assert.equal(healthBody.checks.objectStorage, false);
+    assert.equal(healthBody.checks.redis, false);
 
     // requireAuth never queries the database (it only verifies the JWT signature/expiry), so a
     // minted-but-unregistered token is enough here - this also doubles as a regression guard for
