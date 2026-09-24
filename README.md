@@ -57,10 +57,23 @@ npm run observability:up
 
 Then open Grafana at http://localhost:3000 (default login `admin`/`admin`, or set `GRAFANA_ADMIN_PASSWORD`) - the Prometheus datasource and the "Amplify AI Overview" dashboard are both auto-provisioned from files in `observability/`, no manual setup required.
 
+## Supported documents
+
+| Format | Extraction | Citations point to |
+| --- | --- | --- |
+| PDF (text-based) | Per-page text | Page number |
+| Word (.docx) | Paragraphs, tables, tabs and line breaks | Document (Word has no fixed pages) |
+| Excel (.xlsx) | Every sheet; rows written as `Header: value` pairs; dates decoded | Sheet (number and name) |
+| CSV / plain text | Full text | Document |
+| PNG / JPEG scans | OCR (tesseract) - best at 200 dpi or higher | Document |
+
+Word and Excel are read by a small built-in reader (`server/officeFiles.js`) that inflates one part at a time, keeping worker memory bounded: a 100,000-row spreadsheet extracts in ~3 s, and an 8 MB-of-text Word file in ~40 ms using ~70 MB.
+
 ## Security
 
 - **Rate limiting** (Redis-backed, per IP, survives restarts): login is capped at 10 attempts/15 min (brute-force protection); `/api/questions`, `/api/search`, and `/api/search/evaluate` at 60/15 min (LLM/embedding cost abuse); document upload at 30/15 min; `/api/index/rebuild` at 5/15 min. All configurable via env vars (see `server/.env.example`). Plain reads and the already-queued single-document extract/OCR/index routes are deliberately left unlimited - they're cheap and already guarded by Phase 4's double-submission check and bounded queue concurrency.
-- **Input caps**: `documentIds`/`queryIds` arrays are capped at 100 entries, questions/queries at 2000 characters, and `/api/search/evaluate`'s `cases` array at 20 entries. `GET /api/documents` and `GET /api/reports` are capped at 500 rows as a defensive backstop against unbounded growth (not full pagination - a future improvement if the corpus grows past that).
+- **Input caps**: `documentIds`/`queryIds` arrays are capped at 100 entries, questions/queries at 2000 characters, and `/api/search/evaluate`'s `cases` array at 20 entries. `GET /api/documents` and `GET /api/reports` use limit/offset pagination (max 500 rows per page).
+- **Document extraction bounds**: Word/Excel files are checked against their declared uncompressed size before anything is inflated (zip-bomb defence, `MAX_UNCOMPRESSED_BYTES`, default 250 MB), extracted text is capped at `MAX_EXTRACTED_CHARS` (default 20M), and files that fail to parse are marked failed immediately rather than retried.
 - **Headers**: `helmet` sets CSP, HSTS, and the standard hardening headers on every response.
 - **Dependency scanning**: CI runs `npm audit --audit-level=high` across the full dependency tree (including devDependencies, closing a gap where client build-tooling vulnerabilities were previously invisible to the gate) and `gitleaks` on every push/PR for secret scanning. A full-history scan (`gitleaks detect --source .`) was also run manually and found nothing.
 

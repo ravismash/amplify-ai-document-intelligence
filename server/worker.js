@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
-import { Worker } from 'bullmq';
+import { Worker, UnrecoverableError } from 'bullmq';
 import { connection, QUEUE_PREFIX, extractConcurrency, ocrConcurrency, indexConcurrency } from './queue.js';
 import { withRetry, extractDocument, ocrDocument, indexDocumentChunks, persistChunks } from './processing.js';
 import * as documentsDb from './db/documents.js';
@@ -29,13 +29,14 @@ async function handleExtractLike({ documentId, method }) {
     const chunks = await persistChunks(documentId, result.pages);
     await documentsDb.updateDocument(documentId, {
       status: 'extracted',
-      pageCount: method === 'ocr' ? 1 : result.pages.length,
+      pageCount: method === 'ocr' ? 1 : result.pageCount ?? result.pages.length,
       chunkCount: chunks.length,
       updatedAt: new Date().toISOString()
     });
   } catch (error) {
     await documentsDb.updateDocument(documentId, { status: 'failed', error: error.message, updatedAt: new Date().toISOString() });
-    throw error;
+    // Tells BullMQ not to spend its remaining attempts re-parsing a file that can never succeed.
+    throw error.permanent ? new UnrecoverableError(error.message) : error;
   }
 }
 
