@@ -16,7 +16,7 @@ import * as reportsDb from './db/reports.js';
 import { getPool, closePool } from './db/pool.js';
 import * as usersDb from './db/users.js';
 import { verifyToken, verifyPassword, signToken } from './auth.js';
-import { OLLAMA_HOST, OLLAMA_EMBEDDING_MODEL, normalizeText, withRetry, embedTexts } from './processing.js';
+import { OLLAMA_HOST, OLLAMA_EMBEDDING_MODEL, normalizeText, withRetry, embedTexts, detectSectionMarkers, concatenatePages } from './processing.js';
 import { extractQueue, ocrQueue, indexQueue, checkRedisHealth, enqueueUnique } from './queue.js';
 import { logEvent } from './logger.js';
 import { register, httpRequestDuration, refreshQueueMetrics } from './metrics.js';
@@ -34,6 +34,13 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY?.trim() || '';
 const ANSWER_MODEL = 'claude-sonnet-5';
 const anthropicClient = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL !== undefined ? process.env.OLLAMA_MODEL.trim() : 'qwen2.5:14b';
+// Optional third-party or self-hosted provider for A/B-testing answer quality (e.g. a RunPod vLLM
+// endpoint, Groq, OpenRouter, Together, DeepInfra, Fireworks) - any of them speak the same
+// OpenAI-compatible /chat/completions shape. Unset by default; only active when a base URL is
+// configured, so it never changes behavior for a purely local deployment.
+const CUSTOM_LLM_BASE_URL = process.env.CUSTOM_LLM_BASE_URL?.trim() || '';
+const CUSTOM_LLM_API_KEY = process.env.CUSTOM_LLM_API_KEY?.trim() || '';
+const CUSTOM_LLM_MODEL = process.env.CUSTOM_LLM_MODEL?.trim() || '';
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map((origin) => origin.trim());
 const MAX_QUESTION_LENGTH = 2000;
 const MAX_DOCUMENT_IDS = 100;
@@ -100,6 +107,151 @@ async function removeDocumentData(documentId) {
 // acceptable latency cost. Re-run `node scripts/eval-answers.js` before changing this.
 const ANSWER_CONTEXT_CHUNKS = Number(process.env.ANSWER_CONTEXT_CHUNKS) || 11;
 
+// When the candidate pool (the whole corpus, or a documentIds-scoped subset) is small enough to
+// read in full, skip similarity ranking entirely and send every chunk, in original document
+// order. Similarity search is a lossy approximation for when a document doesn't fit in context -
+// it's also fundamentally bad at structural/positional questions ("how many chapters", "what does
+// chapter 1 say") that don't have a single topically-matching chunk to rank highly. ~20,000 chars
+// (~5,000 tokens) leaves headroom under the local model's 8192-token context (system prompt +
+// question + generation budget) while comfortably covering a handful of typical business
+// documents (a contract, an invoice, a policy - each usually a few thousand characters).
+const FULL_CONTEXT_MAX_CHARS = Number(process.env.FULL_CONTEXT_MAX_CHARS) || 20000;
+
+async function resolveContextChunks(query, documentIds) {
+  const candidates = await chunksDb.getIndexedChunks(documentIds);
+  const totalChars = candidates.reduce((sum, chunk) => sum + chunk.text.length, 0);
+  if (candidates.length && totalChars <= FULL_CONTEXT_MAX_CHARS) {
+    return [...candidates]
+      // chunk_index resets to 0 per page/sheet (not a global counter), so page number must sort
+      // first to reconstruct true reading order across a multi-page/multi-sheet document.
+      .sort((left, right) => left.documentId.localeCompare(right.documentId)
+        || (left.pageNumber || 0) - (right.pageNumber || 0)
+        || left.chunkIndex - right.chunkIndex)
+      .filter((chunk, index, all) => all.findIndex((other) => other.text === chunk.text) === index)
+      .map((chunk) => ({
+        chunkId: chunk.id,
+        documentId: chunk.documentId,
+        text: chunk.text,
+        pageNumber: chunk.pageNumber,
+        score: 1
+      }));
+  }
+  return searchChunks(query, documentIds, ANSWER_CONTEXT_CHUNKS);
+}
+
+const AUTO_SCOPE_SAMPLE_SIZE = 15;
+// How much a document's single best-matching chunk must lead the runner-up's best chunk by, on
+// this app's combined cosine + lexical-overlap score, to count as a clear winner rather than an
+// ambiguous tie. Deliberately conservative (found by testing, not guessed): a 0.2 lead let a
+// status report confidently out-narrow the actual policy document for "who approves the $1.2M
+// budget" - the report discusses the same budget in passing, which is close enough in content
+// similarity to win, but doesn't have the approval rule itself. Unlike the filename check above,
+// content similarity has no way to know it picked a document that merely *mentions* the topic
+// instead of the one that *answers* the question, so this only fires on a much clearer margin;
+// anything narrower stays unscoped, which is safer than a confident wrong guess.
+const AUTO_SCOPE_MIN_LEAD = 0.4;
+
+// An unscoped question against a mixed corpus is the single biggest accuracy risk found in this
+// app's own eval history (72% unscoped vs. 94% scoped, identical questions) - irrelevant chunks
+// from unrelated documents dilute or outright crowd out the right one in the final prompt.
+// Manually scoping fixes that; this reproduces the same effect automatically for the common case
+// where a question is clearly "about" one document, without requiring the user to click anything.
+async function resolveAutoScope(question, documentIds) {
+  if (documentIds) return documentIds; // user already scoped explicitly - never override that
+
+  // A distinctive word from the question appearing in a document's own name ("Northwind" in the
+  // question, "Northwind Master Supply Agreement.pdf" as a document) is checked first - it's a
+  // far more reliable signal than content similarity when the corpus is lopsided, per the failure
+  // described above, where content-based scoring alone picked the wrong document.
+  const questionTerms = [...meaningfulTerms(expandedSearchTerms(question))].filter((term) => term.length > 3);
+  const documents = await documentsDb.getAllDocuments();
+  const nameMatches = documents.filter((document) => {
+    const nameTerms = new Set(searchTerms(document.name));
+    return questionTerms.some((term) => nameTerms.has(term));
+  });
+  if (nameMatches.length && nameMatches.length <= 3) return nameMatches.map((document) => document.id);
+
+  // Otherwise fall back to content-based dominance, using each document's single best-matching
+  // chunk rather than the sum across however many of its chunks land in the sample - so a large
+  // document doesn't win purely by having more chances to score reasonably on generic terms.
+  const sample = await searchChunks(question, null, AUTO_SCOPE_SAMPLE_SIZE);
+  const maxByDocument = new Map();
+  for (const result of sample) {
+    maxByDocument.set(result.documentId, Math.max(maxByDocument.get(result.documentId) || 0, result.score));
+  }
+  const ranked = [...maxByDocument.entries()].sort((left, right) => right[1] - left[1]);
+  if (!ranked.length) return null;
+  const [, topScore] = ranked[0];
+  const runnerUpScore = ranked[1]?.[1] ?? 0;
+  if (topScore - runnerUpScore < AUTO_SCOPE_MIN_LEAD) return null;
+  // Include any other document within the same close margin of the top one, so a question
+  // spanning two closely related documents (e.g. a contract and its matching invoice) isn't cut
+  // down to just one.
+  return ranked.filter(([, score]) => topScore - score < AUTO_SCOPE_MIN_LEAD).map(([documentId]) => documentId);
+}
+
+// Extracts a leading chapter/section number from a detected section title ("Chapter 3" -> 3,
+// "3. Competitive quotes" -> 3) so a question naming a number can be matched to the right section.
+function sectionNumber(title) {
+  const match = title.match(/(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty'];
+
+// A question can name a chapter either way ("chapter 1" or "chapter one") - this app's own eval
+// history shows both phrasings in real use, so both need to resolve to the same section.
+function extractNamedNumber(question) {
+  const digitMatch = question.match(/\b(?:chapter|section)\s+(\d+)\b/i);
+  if (digitMatch) return Number(digitMatch[1]);
+  const wordMatch = question.match(/\b(?:chapter|section)\s+([a-z]+)\b/i);
+  if (wordMatch) {
+    const index = NUMBER_WORDS.indexOf(wordMatch[1].toLowerCase());
+    if (index >= 0) return index;
+  }
+  return null;
+}
+
+// Structural questions ("how many chapters", "what does chapter 3 say") ask about a document's
+// own organization, not a fact any single chunk contains - similarity search can't answer them
+// (see FULL_CONTEXT_MAX_CHARS comment above). Sections are computed fresh from the stored
+// extraction on every call, not from chunks.section: a chunk can span multiple detected sections
+// (a short document's whole text can be one or two chunks), so per-chunk section labels are
+// reliable for large documents only by coincidence, never guaranteed for small ones. Only handled
+// when scoped to exactly one document, where "the document's sections" is unambiguous; returns
+// null (falls through to the normal retrieval flow) for anything else, including a document with
+// no detected structure at all.
+async function resolveStructuralAnswer(question, documentIds) {
+  if (!documentIds || documentIds.length !== 1) return null;
+  const [documentId] = documentIds;
+  const extraction = await extractionsDb.getExtractionByDocumentId(documentId);
+  if (!extraction?.pages?.length) return null;
+  const markers = detectSectionMarkers(extraction.pages);
+  if (!markers.length) return null;
+
+  if (/\bhow many\b.*\b(chapters?|sections?)\b/i.test(question) || /\b(list|what are)\b.*\b(chapters?|sections?)\b/i.test(question)) {
+    return {
+      text: `This document has ${markers.length} detected section${markers.length === 1 ? '' : 's'}: ${markers.map((marker) => marker.title).join(', ')}.`,
+      model: 'structural-lookup',
+      evidence: []
+    };
+  }
+
+  const targetNumber = extractNamedNumber(question);
+  if (targetNumber !== null) {
+    const markerIndex = markers.findIndex((marker) => sectionNumber(marker.title) === targetNumber);
+    if (markerIndex < 0) return null;
+    const fullText = concatenatePages(extraction.pages);
+    const sectionText = fullText.slice(markers[markerIndex].globalOffset, markers[markerIndex + 1]?.globalOffset ?? fullText.length).trim();
+    if (!sectionText) return null;
+    const syntheticResult = { chunkId: `section_${documentId}_${targetNumber}`, documentId, text: sectionText, pageNumber: markers[markerIndex].pageNumber, score: 1 };
+    return generateGroundedAnswer(question, [syntheticResult]);
+  }
+
+  return null;
+}
+
 async function searchChunks(query, documentIds = null, limit = 5) {
   const [queryEmbedding] = await embedTexts([query], 'search_query: ');
   const queryTerms = meaningfulTerms(expandedSearchTerms(query));
@@ -126,7 +278,11 @@ function createExtractiveAnswer(query, results) {
   const relevantResults = results.map((result) => ({
     ...result,
     matchedTerms: searchTerms(result.text).filter((term) => queryTerms.has(term))
-  })).filter((result) => result.matchedTerms.length > 0);
+  })).filter((result) => result.matchedTerms.length > 0)
+    // Rank by lexical match strength rather than trusting input order - `results` is relevance-
+    // sorted when it comes from searchChunks, but document-ordered when it comes from
+    // resolveContextChunks' full-context path, so this function must not assume index 0 is best.
+    .sort((left, right) => right.matchedTerms.length - left.matchedTerms.length);
   const hasLexicalEvidence = relevantResults.length > 0;
   // Empirically retuned for nomic-embed-text (was 0.45, tuned against the old demo-hash
   // embedding): real embeddings sit on a much narrower, higher baseline range - unrelated
@@ -161,7 +317,12 @@ async function callOllama(system, user) {
     body: JSON.stringify({
       model: OLLAMA_MODEL,
       stream: false,
-      options: { temperature: 0.1 },
+      // num_ctx: the prompt (system + up to ANSWER_CONTEXT_CHUNKS excerpts) can run to ~3k
+      // tokens, and Ollama's default 4096 context leaves too little room for the reply. With
+      // context-shift enabled, overflow truncates from the *front* rather than erroring - which
+      // can silently drop the system prompt (including the prompt-injection defenses). 8192
+      // gives real headroom without exceeding this model's trained context length.
+      options: { temperature: 0.1, num_ctx: 8192 },
       messages: [
         { role: 'system', content: system },
         { role: 'user', content: user }
@@ -171,6 +332,28 @@ async function callOllama(system, user) {
   if (!response.ok) throw new Error(`Ollama request failed: ${response.status}`);
   const data = await response.json();
   return (data.message?.content || '').trim();
+}
+
+async function callCustomProvider(system, user) {
+  const response = await fetch(`${CUSTOM_LLM_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(CUSTOM_LLM_API_KEY ? { authorization: `Bearer ${CUSTOM_LLM_API_KEY}` } : {})
+    },
+    body: JSON.stringify({
+      model: CUSTOM_LLM_MODEL,
+      temperature: 0.1,
+      max_tokens: 500,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user }
+      ]
+    })
+  });
+  if (!response.ok) throw new Error(`Custom LLM provider request failed: ${response.status}`);
+  const data = await response.json();
+  return (data.choices?.[0]?.message?.content || '').trim();
 }
 
 async function callAnthropic(system, user) {
@@ -187,6 +370,10 @@ async function callAnthropic(system, user) {
 async function generateGroundedAnswer(query, results) {
   if (!results.length) return null;
   const providers = [
+    // Listed first when configured, so an eval run picks it up as the primary answer source
+    // (answerModel in the response/eval output shows which provider actually answered each
+    // question, giving a clean side-by-side against the ollama:/claude- baselines already measured).
+    ...(CUSTOM_LLM_BASE_URL && CUSTOM_LLM_MODEL ? [{ name: `custom:${CUSTOM_LLM_MODEL}`, call: callCustomProvider }] : []),
     ...(OLLAMA_HOST && OLLAMA_MODEL ? [{ name: `ollama:${OLLAMA_MODEL}`, call: callOllama }] : []),
     ...(anthropicClient ? [{ name: ANSWER_MODEL, call: callAnthropic }] : [])
   ];
@@ -196,7 +383,10 @@ async function generateGroundedAnswer(query, results) {
   let lastError;
   for (const provider of providers) {
     try {
-      const text = await withRetry(() => provider.call(system, user), 1);
+      // attempts=2: with only the local Ollama provider configured, a transient failure (dropped
+      // connection, a request queued behind another and briefly timing out) would otherwise fail
+      // the whole answer with nothing to fall back to.
+      const text = await withRetry(() => provider.call(system, user), 2);
       if (isNotFoundResponse(text)) return null;
       // The prompt asks for [n] markers; only those excerpts become citations. If the model gave
       // none, fall back to the top-ranked excerpt rather than citing everything it was shown.
@@ -431,6 +621,37 @@ app.post('/api/search/evaluate', llmRouteLimiter, async (req, res) => {
   });
 });
 
+// Runs the structural -> full-context/retrieval -> extractive-fallback pipeline for one document
+// scope. Factored out so /api/questions can retry it with a different scope (see the auto-scope
+// fallback below) without duplicating the whole resolution flow.
+async function resolveAnswerForScope(question, scopedDocumentIds, queryId) {
+  let structuralAnswer = null;
+  try {
+    structuralAnswer = await resolveStructuralAnswer(question, scopedDocumentIds);
+  } catch (error) {
+    logEvent('structural_answer_failed', { queryId, error: error.message });
+  }
+
+  const results = structuralAnswer ? [] : await resolveContextChunks(question, scopedDocumentIds);
+  let answer = structuralAnswer;
+  let generationFailed = !structuralAnswer;
+  let answerModel = structuralAnswer?.model;
+  if (!structuralAnswer) {
+    try {
+      answer = await generateGroundedAnswer(question, results);
+      generationFailed = false;
+      if (answer) answerModel = answer.model;
+    } catch (error) {
+      logEvent('answer_generation_failed', { queryId, error: error.message });
+    }
+  }
+  if (generationFailed) {
+    answer = createExtractiveAnswer(question, results);
+    if (answer) answerModel = 'extractive-fallback';
+  }
+  return { answer, answerModel };
+}
+
 app.post('/api/questions', llmRouteLimiter, async (req, res) => {
   const question = typeof req.body?.question === 'string' ? normalizeText(req.body.question) : '';
   const documentIds = Array.isArray(req.body?.documentIds) ? req.body.documentIds : null;
@@ -454,24 +675,32 @@ app.post('/api/questions', llmRouteLimiter, async (req, res) => {
     status: 'retrieving',
     answer: null,
     answerModel: null,
+    autoScopedDocumentIds: null,
     evidence: [],
     citations: [],
     createdAt: new Date().toISOString()
   };
-  const results = await searchChunks(question, documentIds, ANSWER_CONTEXT_CHUNKS);
-  let answer = null;
-  let generationFailed = true;
+  let effectiveDocumentIds = documentIds;
   try {
-    answer = await generateGroundedAnswer(question, results);
-    generationFailed = false;
-    if (answer) query.answerModel = answer.model;
+    effectiveDocumentIds = await resolveAutoScope(question, documentIds);
+    if (effectiveDocumentIds && !documentIds) query.autoScopedDocumentIds = effectiveDocumentIds;
   } catch (error) {
-    logEvent('answer_generation_failed', { queryId: query.id, error: error.message });
+    logEvent('auto_scope_failed', { queryId: query.id, error: error.message });
   }
-  if (generationFailed) {
-    answer = createExtractiveAnswer(question, results);
-    if (answer) query.answerModel = 'extractive-fallback';
+
+  let { answer, answerModel } = await resolveAnswerForScope(question, effectiveDocumentIds, query.id);
+  // Auto-scoping can guess the wrong single document when two documents plausibly relate to the
+  // same question but only one actually has the answer (found in testing: a question about a
+  // budget approval rule auto-scoped to a status report that mentions the same budget, instead of
+  // the policy document with the actual approval table) - narrowing to the wrong document
+  // guarantees a miss, worse than the original unscoped search, which at least kept the right
+  // document in the candidate pool. Retrying unscoped costs nothing on the common (correct-guess)
+  // path and recovers this specific failure mode on the rare wrong-guess one.
+  if (!answer && query.autoScopedDocumentIds) {
+    ({ answer, answerModel } = await resolveAnswerForScope(question, documentIds, query.id));
+    if (answer) query.autoScopedDocumentIds = null;
   }
+  if (answer) query.answerModel = answerModel;
   if (!answer) {
     query.status = 'no_evidence';
     query.answer = 'No indexed document evidence was found for this question.';

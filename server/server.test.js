@@ -30,7 +30,15 @@ let workerProcess;
 
 // Child output must be consumed: an unread stdout/stderr pipe fills up and can stall or break the
 // child. Set TEST_LOG_DIR to keep each process's logs for debugging; otherwise they're discarded.
+// Either way, the last ~4000 chars are kept on child.recentOutput so a failed startup (e.g. a
+// dedicated test server that never becomes ready) can report *why* instead of just "ECONNREFUSED".
 function drainOutput(child, name) {
+  child.recentOutput = '';
+  const capture = (chunk) => {
+    child.recentOutput = (child.recentOutput + chunk.toString()).slice(-4000);
+  };
+  child.stdout.on('data', capture);
+  child.stderr.on('data', capture);
   if (process.env.TEST_LOG_DIR) {
     const log = createWriteStream(`${process.env.TEST_LOG_DIR}/${name}.log`, { flags: 'a' });
     child.stdout.pipe(log);
@@ -81,6 +89,9 @@ before(async () => {
     // OLLAMA_MODEL follows the same explicit-empty-disables convention as OLLAMA_HOST.
     OLLAMA_MODEL: '',
     ANTHROPIC_API_KEY: '',
+    // Blank regardless of what the developer's own shell/.env has configured (e.g. for manual
+    // A/B testing against a third-party provider) - tests must not depend on the runner's env.
+    CUSTOM_LLM_BASE_URL: '',
     // Rate-limit counters live in Redis, not this test's scratch DB, so they persist across
     // separate `npm test` runs within the same window - effectively unlimited here so ordinary
     // functional tests (which upload/query far more than a real user would in 15 minutes) never
@@ -113,15 +124,26 @@ before(async () => {
   ({ token: authToken } = await login.json());
 });
 
-async function waitForServer() {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+// Shared by every spawned-process test below. 100 x 100ms = 10s: under load (e.g. this suite run
+// right after a previous one, before the OS has reclaimed the last run's processes/ports) a
+// tighter budget was enough to make a perfectly healthy-but-slow-to-boot server look unreachable.
+// Always throws on timeout - each call site used to repeat this loop with no such check, silently
+// falling through to the first real request, which then failed with a confusing bare ECONNREFUSED
+// instead of a clear "this process never came up" error.
+async function waitForHealth(url, child) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (child?.exitCode !== null && child?.exitCode !== undefined) break;
     try {
-      const response = await fetch(`${baseUrl}/api/health`);
-      if (response.ok) return;
+      if ((await fetch(`${url}/api/health`)).ok) return;
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error('Test server did not start');
+  const output = child?.recentOutput ? `Recent output:\n${child.recentOutput}` : '';
+  throw new Error(`server at ${url} never became healthy. ${output}`);
+}
+
+async function waitForServer() {
+  await waitForHealth(baseUrl);
 }
 
 async function request(path, options = {}) {
@@ -569,7 +591,7 @@ test('an unreachable database degrades to a clean error instead of crashing the 
   // request, not just the failing one. Reproduced here without needing a real outage: point a
   // fresh server instance at an address nothing is listening on.
   const brokenPort = 4102;
-  const brokenProcess = spawn(process.execPath, ['server.js'], {
+  const brokenProcess = drainOutput(spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
     env: {
       ...process.env,
@@ -582,17 +604,11 @@ test('an unreachable database degrades to a clean error instead of crashing the 
       ANTHROPIC_API_KEY: ''
     },
     stdio: ['ignore', 'pipe', 'pipe']
-  });
+  }), `server-${brokenPort}`);
 
   try {
     const brokenBaseUrl = `http://localhost:${brokenPort}`;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      try {
-        const response = await fetch(`${brokenBaseUrl}/api/health`);
-        if (response.ok) break;
-      } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    await waitForHealth(brokenBaseUrl, brokenProcess);
 
     const health = await fetch(`${brokenBaseUrl}/api/health`);
     assert.equal(health.status, 200, 'the process must start and answer health checks even with unreachable infra');
@@ -628,7 +644,7 @@ test('repeated failed logins are rate limited', async () => {
   // this test's deliberate exhaustion doesn't bleed into every other test that calls /auth/login).
   const rateLimitedPort = 4103;
   const rateLimitedBaseUrl = `http://localhost:${rateLimitedPort}`;
-  const rateLimitedProcess = spawn(process.execPath, ['server.js'], {
+  const rateLimitedProcess = drainOutput(spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
     env: {
       ...process.env,
@@ -644,16 +660,10 @@ test('repeated failed logins are rate limited', async () => {
       ANTHROPIC_API_KEY: ''
     },
     stdio: ['ignore', 'pipe', 'pipe']
-  });
+  }), `server-${rateLimitedPort}`);
 
   try {
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      try {
-        const response = await fetch(`${rateLimitedBaseUrl}/api/health`);
-        if (response.ok) break;
-      } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    await waitForHealth(rateLimitedBaseUrl, rateLimitedProcess);
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const response = await fetch(`${rateLimitedBaseUrl}/api/auth/login`, {
@@ -739,16 +749,17 @@ async function startDedicatedServer(dedicatedPort, envOverrides) {
       LLM_RATE_LIMIT_MAX: '100000',
       OLLAMA_MODEL: '',
       ANTHROPIC_API_KEY: '',
+      CUSTOM_LLM_BASE_URL: '',
       ...envOverrides
     },
     stdio: ['ignore', 'pipe', 'pipe']
   }), `server-${dedicatedPort}`);
   const url = `http://localhost:${dedicatedPort}`;
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    try {
-      if ((await fetch(`${url}/api/health`)).ok) break;
-    } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 100));
+  try {
+    await waitForHealth(url, child);
+  } catch (error) {
+    child.kill('SIGTERM');
+    throw error;
   }
   return {
     url,

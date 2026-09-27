@@ -9,6 +9,7 @@ function rowToQuery(row) {
     status: row.status,
     answer: row.answer,
     answerModel: row.answer_model,
+    autoScopedDocumentIds: row.auto_scoped_document_ids,
     evidence: row.evidence,
     citations: row.citations,
     createdAt: row.created_at.toISOString()
@@ -17,10 +18,10 @@ function rowToQuery(row) {
 
 export async function insertQuery(query) {
   const { rows } = await getPool().query(
-    `INSERT INTO queries (id, question, document_ids, status, answer, answer_model, evidence, citations, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `INSERT INTO queries (id, question, document_ids, status, answer, answer_model, auto_scoped_document_ids, evidence, citations, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING *`,
-    [query.id, query.question, query.documentIds, query.status, query.answer, query.answerModel,
+    [query.id, query.question, query.documentIds, query.status, query.answer, query.answerModel, query.autoScopedDocumentIds,
       JSON.stringify(query.evidence), JSON.stringify(query.citations), query.createdAt]
   );
   return rowToQuery(rows[0]);

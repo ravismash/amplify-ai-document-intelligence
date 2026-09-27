@@ -7,3 +7,5 @@ dist/
 server/storage/*
 !server/storage/.gitkeep
 .claude/
+__pycache__/
+*.pyc

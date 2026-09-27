@@ -129,6 +129,7 @@ export default function App() {
   const [documentSearch, setDocumentSearch] = useState('');
   const [documentSort, setDocumentSort] = useState('recent');
   const [messages, setMessages] = useState([]);
+  const [selectedDocumentIds, setSelectedDocumentIds] = useState([]);
   const fileInputRef = useRef(null);
   const [documents, setDocuments] = useState([]);
   const [documentsTotal, setDocumentsTotal] = useState(0);
@@ -376,6 +377,12 @@ export default function App() {
     processFiles(event.dataTransfer.files);
   }
 
+  function toggleDocumentScope(documentId) {
+    setSelectedDocumentIds((current) => (
+      current.includes(documentId) ? current.filter((id) => id !== documentId) : [...current, documentId]
+    ));
+  }
+
   async function handleAsk(event) {
     event.preventDefault();
     const trimmedQuestion = question.trim();
@@ -388,7 +395,10 @@ export default function App() {
       const response = await apiFetch(`${API_BASE}/api/questions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: trimmedQuestion })
+        body: JSON.stringify({
+          question: trimmedQuestion,
+          ...(selectedDocumentIds.length ? { documentIds: selectedDocumentIds } : {})
+        })
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Question failed');
@@ -536,6 +546,29 @@ export default function App() {
             <div className="panel-header">
               <h2>Ask about documents</h2>
             </div>
+            {documents.some((document) => document.embeddingStatus === 'indexed') && (
+              <div className="scope-picker">
+                <span className="scope-label">Search:</span>
+                <button
+                  className={`scope-chip ${selectedDocumentIds.length === 0 ? 'active' : ''}`}
+                  onClick={() => setSelectedDocumentIds([])}
+                  type="button"
+                >
+                  All documents
+                </button>
+                {documents.filter((document) => document.embeddingStatus === 'indexed').map((document) => (
+                  <button
+                    className={`scope-chip ${selectedDocumentIds.includes(document.id) ? 'active' : ''}`}
+                    key={document.id}
+                    onClick={() => toggleDocumentScope(document.id)}
+                    title={document.name}
+                    type="button"
+                  >
+                    {document.name}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="chat-box">
               {messages.length === 0 && <p className="chat-empty">Ask a question to search your indexed documents.</p>}
               {messages.map((message) => (
